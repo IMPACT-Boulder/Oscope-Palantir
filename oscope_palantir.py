@@ -598,10 +598,23 @@ class FitFilterDialog(QDialog):
             base = []
             if fit_name in FIT_LIB:
                 base = list(FIT_LIB[fit_name][1])
-            # Add known derived fields that may be present in records
-            derived = ["charge", "mass", "radius", "impact_time"]
+            # Special-case low_pass_max: expose only its relevant fields
+            if fit_name == "low_pass_max":
+                items = ["width", "value", "t_at"]
+            else:
+                # Derived fields depend on fit type
+                derived = ["impact_time"]  # available on any record if user marked it
+                if fit_name in ("QD3Fit", "QDMFit"):
+                    derived += ["charge", "mass", "radius"]
+                # Merge base + derived without duplicates
+                seen = set()
+                items = []
+                for nm in base + derived:
+                    if nm not in seen:
+                        items.append(nm)
+                        seen.add(nm)
             self.param_combo.clear()
-            self.param_combo.addItems(base + derived)
+            self.param_combo.addItems(items)
         def refresh_op():
             is_between = (self.op_combo.currentText() == "between")
             self.thr2_row_lbl.setVisible(is_between)
@@ -1043,7 +1056,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         # Clear all fits for selected channel on current event
         self.btn_clear_chan = QPushButton("Clear Chan Fits")
         self.btn_clear_chan.setIcon(qta.icon('fa5s.eraser', color=self.accent))
-        self.btn_clear_chan.setToolTip("Remove all fits for selected channel on this event (Ctrl+R)")
+        self.btn_clear_chan.setToolTip("Remove all fits for selected channel on this event (Shift+R)")
         self.btn_clear_chan.clicked.connect(self.clear_channel_fits)
         self.btn_clear_chan.setFixedWidth(self.unit_width)
         self.btn_clear_chan.setMaximumHeight(24)
@@ -1292,7 +1305,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             except Exception as e:
                 QMessageBox.warning(self, "Load Error", f"Failed to load {os.path.basename(path)}: {e}")
                 continue
-            self.current_data[ch] = (t, y - np.mean(y), meta)
+            self.current_data[ch] = (t, y, meta)
 
         if not self.current_data:
             QMessageBox.warning(self, "No Data", f"No waveforms were loaded for event {evt}")
@@ -2084,7 +2097,6 @@ class OscilloscopeAnalyzer(QMainWindow):
 
             try:
                 t, y, meta = self.trc.open(ch_path)
-                y = y - np.mean(y)
             except Exception:
                 continue
 
@@ -2998,7 +3010,6 @@ class OscilloscopeAnalyzer(QMainWindow):
                     _, y, _ = self.trc.open(ch_path)
                 except Exception:
                     continue
-                y = y - np.mean(y)
                 sd = float(np.std(y))
                 if sd <= 0:
                     continue

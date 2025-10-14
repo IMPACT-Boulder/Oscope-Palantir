@@ -326,10 +326,39 @@ class FitResultsVisualizer(QMainWindow):
             df['CSA_peak_time'] = peak_t
             sig = inspect.signature(CSA_pulse)
             nparams = len(sig.parameters)
-            if nparams >= 9 and 'C' in df.columns:
-                df['CSA_peak'] = CSA_pulse(peak_t.values, t0.values, df['C0'].values, df['C1'].values, df['C2'].values, df['T0'].values, df['T1'].values, df['T2'].values, df['C'].values)
+            c0_vals = df['C0'].values
+            c1_vals = df['C1'].values
+            baseline = c0_vals - c1_vals
+            if 'C' in df.columns:
+                c_vals = df['C'].values
+                baseline = baseline + c_vals
             else:
-                df['CSA_peak'] = CSA_pulse(peak_t.values, t0.values, df['C0'].values, df['C1'].values, df['C2'].values, df['T0'].values, df['T1'].values, df['T2'].values)
+                c_vals = np.zeros_like(baseline, dtype=float)
+
+            if nparams >= 9:
+                peak_vals = CSA_pulse(
+                    peak_t.values,
+                    t0.values,
+                    c0_vals,
+                    c1_vals,
+                    df['C2'].values,
+                    df['T0'].values,
+                    df['T1'].values,
+                    df['T2'].values,
+                    c_vals,
+                )
+            else:
+                peak_vals = CSA_pulse(
+                    peak_t.values,
+                    t0.values,
+                    c0_vals,
+                    c1_vals,
+                    df['C2'].values,
+                    df['T0'].values,
+                    df['T1'].values,
+                    df['T2'].values,
+                )
+            df['CSA_peak'] = peak_vals - baseline  # report peak above asymptotic baseline (C0 - C1 [+ C])
         except Exception as e:
             self.dprint(f"[_maybe_add_csa_derivatives] skip due to: {e}")
         return df
@@ -371,6 +400,26 @@ class FitResultsVisualizer(QMainWindow):
             df['peak_value'] = df.apply(_row_peak_value, axis=1)
         except Exception as e:
             self.dprint(f"[_maybe_add_skew_peak] failed: {e}")
+        return df
+
+    def _apply_qd_inversion_sign(self, df: pd.DataFrame) -> pd.DataFrame:
+        """For QD fits, flip q/charge sign when the fit was performed on inverted data."""
+        if df.empty or 'inverted' not in df.columns or 'q' not in df.columns:
+            return df
+        try:
+            mask = df['inverted'].fillna(0).astype(float) != 0.0
+        except Exception:
+            mask = df['inverted'].astype(bool)
+        if not mask.any():
+            return df
+        # Preserve the raw fit amplitude for reference/debugging.
+        if 'q_fit' not in df.columns:
+            df['q_fit'] = df['q'].copy()
+        df.loc[mask, 'q'] = -df.loc[mask, 'q'].abs()
+        if 'charge' in df.columns:
+            if 'charge_fit' not in df.columns:
+                df['charge_fit'] = df['charge'].copy()
+            df.loc[mask, 'charge'] = -df.loc[mask, 'charge'].abs()
         return df
 
     def _apply_pvdf_q(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -447,6 +496,7 @@ class FitResultsVisualizer(QMainWindow):
             if isinstance(ft, str) and _sanitize(ft) in ('skew_gaussian',):
                 g2 = self._maybe_add_skew_peak(g2)
             if isinstance(ft, str) and _sanitize(ft) in ('qd3fit','qdmfit'):
+                g2 = self._apply_qd_inversion_sign(g2)
                 g2 = self._maybe_add_qd_cal(g2)
             # Apply PVDF q(v) conversion to any available peak/amp field
             g2 = self._apply_pvdf_q(g2)
