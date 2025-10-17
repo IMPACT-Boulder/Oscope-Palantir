@@ -9,10 +9,11 @@ Purpose:
     figures or fit parameters for further study.
 """
 
-import sys, os, re, csv, lmfit, matplotlib
+import sys, os, re, csv, lmfit, matplotlib, threading
 import numpy as np, pandas as pd, scipy.signal as sig
 from   scipy.signal import fftconvolve
 from   scipy.optimize import curve_fit
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRegExp
@@ -20,7 +21,8 @@ from PyQt5.QtGui import QRegExpValidator, QKeySequence
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QDoubleSpinBox, QSpinBox,
     QPushButton, QComboBox, QFileDialog, QMessageBox, QLabel, QCheckBox, QDialog, QInputDialog,
-    QProgressDialog, QSizePolicy, QTableWidget, QTableWidgetItem, QLineEdit, QDialogButtonBox)
+    QProgressDialog, QSizePolicy, QTableWidget, QTableWidgetItem, QLineEdit, QDialogButtonBox,
+    QListWidget, QListWidgetItem)
 
 import qtawesome as qta
 
@@ -58,6 +60,24 @@ FIT_LIB = {
     # Special measurement: Savitzky–Golay low-pass then take max (invert -> min)
     "low_pass_max": (None, ["width"])  # width = SG window samples (odd)
 }
+
+# Consistent styling for traces, filters, and fits
+RAW_TRACE_COLOR   = "C0"          # keep default blue for raw data
+SG_FILTER_COLOR   = "#43a047"     # brighter green for SG overlay
+SG_FILTER_STYLE   = dict(color=SG_FILTER_COLOR, linewidth=1.0, alpha=0.85, zorder=2.4)
+FIT_LINE_WIDTH    = 1.0
+FIT_COLOR_PRESETS = {
+    "QD3Fit": "#ff8f00",         # deep orange
+    "QDMFit": "#d81b60",         # magenta
+    "CSA_pulse": "#8e24aa",      # purple
+    "skew_gaussian": "#00897b",  # teal
+    "gaussian": "#f4511e",       # warm red-orange
+    "low_pass_max": "#ef5350",   # red marker
+}
+FIT_COLOR_FALLBACK = [
+    "#5e35b1", "#29b6f6", "#7cb342", "#6d4c41",
+    "#ff7043", "#26a69a", "#ab47bc", "#c0ca33",
+]
 
 # Set plot defaults
 matplotlib.rcParams['axes.labelsize']  = 12
@@ -371,8 +391,8 @@ class SciFitParamsDialog(QDialog):
 
 
 class BatchFitDialog(QDialog):
-    """Collects event range and time window for batch fitting."""
-    def __init__(self, parent, evt_min, evt_max, tmin=None, tmax=None):
+    """Collects event range, time window, and threading options for batch fitting."""
+    def __init__(self, parent, evt_min, evt_max, tmin=None, tmax=None, default_threads=1, max_threads=None):
         super().__init__(parent)
         self.setWindowTitle("Batch Fit Configuration")
         layout = QVBoxLayout(self)
@@ -402,6 +422,19 @@ class BatchFitDialog(QDialog):
         self.t_end.setToolTip("Upper bound of fit window in seconds")
         grid.addWidget(self.t_end, 3, 1)
 
+        grid.addWidget(QLabel("Worker Threads"), 4, 0)
+        self.thread_spin = QSpinBox()
+        max_threads = max_threads or max(1, os.cpu_count() or 1)
+        self.thread_spin.setRange(1, max_threads)
+        try:
+            default_threads = int(default_threads)
+        except Exception:
+            default_threads = 1
+        default_threads = max(1, min(default_threads, max_threads))
+        self.thread_spin.setValue(default_threads)
+        self.thread_spin.setToolTip("Number of parallel worker threads to use during batch fitting")
+        grid.addWidget(self.thread_spin, 4, 1)
+
         note = QLabel("Uses the currently selected Fit + Channel + Invert.")
         layout.addWidget(note)
 
@@ -425,7 +458,75 @@ class BatchFitDialog(QDialog):
             raise ValueError("Time End must be > Time Start")
         if ev1 < ev0:
             raise ValueError("End Event must be >= Start Event")
-        return ev0, ev1, t0, t1
+        threads = int(self.thread_spin.value())
+        return ev0, ev1, t0, t1, threads
+
+
+class WaveformCoaddDialog(QDialog):
+    """Configuration dialog for combining multiple waveforms."""
+
+    def __init__(self, parent, event_keys, channels, default_events=None, default_channel=None):
+        super().__init__(parent)
+        self.setWindowTitle("Co-Add Waveforms")
+        self.setMinimumWidth(360)
+
+        layout = QVBoxLayout(self)
+
+        intro = QLabel("Select one or more events to combine. Waveforms are loaded fresh "
+                       "from disk using the selected channel.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        grid = QGridLayout()
+        layout.addLayout(grid)
+
+        grid.addWidget(QLabel("Channel"), 0, 0)
+        self.channel_combo = QComboBox()
+        channel_strings = [str(ch) for ch in channels]
+        self.channel_combo.addItems(channel_strings)
+        if default_channel is not None and str(default_channel) in channel_strings:
+            self.channel_combo.setCurrentText(str(default_channel))
+        grid.addWidget(self.channel_combo, 0, 1)
+
+        grid.addWidget(QLabel("Combine As"), 1, 0)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Average", "Sum"])
+        grid.addWidget(self.mode_combo, 1, 1)
+
+        layout.addWidget(QLabel("Events"))
+
+        self.event_list = QListWidget()
+        self.event_list.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
+        for key in event_keys:
+            item = QListWidgetItem(str(key))
+            if default_events and key in default_events:
+                item.setSelected(True)
+            self.event_list.addItem(item)
+        self.event_list.setMinimumHeight(200)
+        layout.addWidget(self.event_list)
+
+        self.overlay_chk = QCheckBox("Overlay individual traces in result")
+        self.overlay_chk.setChecked(True)
+        layout.addWidget(self.overlay_chk)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def values(self):
+        selected = [item.text() for item in self.event_list.selectedItems()]
+        if not selected:
+            raise ValueError("Select at least one event to combine.")
+        channel = int(self.channel_combo.currentText())
+        mode = self.mode_combo.currentText().lower()
+        overlay = self.overlay_chk.isChecked()
+        return {
+            "events": selected,
+            "channel": channel,
+            "mode": mode,
+            "overlay": overlay,
+        }
 
 
 class FeatureScanDialog(QDialog):
@@ -598,23 +699,10 @@ class FitFilterDialog(QDialog):
             base = []
             if fit_name in FIT_LIB:
                 base = list(FIT_LIB[fit_name][1])
-            # Special-case low_pass_max: expose only its relevant fields
-            if fit_name == "low_pass_max":
-                items = ["width", "value", "t_at"]
-            else:
-                # Derived fields depend on fit type
-                derived = ["impact_time"]  # available on any record if user marked it
-                if fit_name in ("QD3Fit", "QDMFit"):
-                    derived += ["charge", "mass", "radius"]
-                # Merge base + derived without duplicates
-                seen = set()
-                items = []
-                for nm in base + derived:
-                    if nm not in seen:
-                        items.append(nm)
-                        seen.add(nm)
+            # Add known derived fields that may be present in records
+            derived = ["charge", "mass", "radius", "impact_time"]
             self.param_combo.clear()
-            self.param_combo.addItems(items)
+            self.param_combo.addItems(base + derived)
         def refresh_op():
             is_between = (self.op_combo.currentText() == "between")
             self.thr2_row_lbl.setVisible(is_between)
@@ -706,6 +794,9 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.span_selectors  = {}
         self.sg_filtered     = {}
         self.metaArr         = None
+        self._fit_color_map  = dict(FIT_COLOR_PRESETS)
+        self._fit_color_palette = list(FIT_COLOR_FALLBACK)
+        self._fit_color_index = 0
         self._child_windows  = []  # keep references to child windows (e.g., Results Plotter)
 
         def wrap_control(label_text, control):
@@ -801,13 +892,22 @@ class OscilloscopeAnalyzer(QMainWindow):
 
         # Decimation factor for plotting
         self.decim_spin = QSpinBox()
-        self.decim_spin.setRange(1, 100)
+        self.decim_spin.setRange(1, 10000)
         self.decim_spin.setValue(2)
-        self.decim_spin.setToolTip("Plot every Nth sample; 1=all data, 100=1% of points")
+        self.decim_spin.setToolTip("Plot every Nth sample; 1=all data, larger values skip more points")
         self.decim_spin.valueChanged.connect(self._on_decim_change)
         self.decim_spin.setFixedWidth(60)
         self.decim_spin.setMaximumHeight(24)
         nav_layout.addWidget(wrap_control("Decim:", self.decim_spin))
+
+        self.btn_coadd = QPushButton("Co-Add Waves")
+        self.btn_coadd.setIcon(qta.icon('fa5s.layer-group', color=self.accent))
+        self.btn_coadd.setToolTip("Combine selected events into a summed or averaged waveform")
+        self.btn_coadd.clicked.connect(self.coadd_waveforms)
+        self.btn_coadd.setFixedWidth(self.unit_width)
+        self.btn_coadd.setMaximumHeight(24)
+        nav_layout.addWidget(self.btn_coadd)
+
         nav_layout.addStretch()
 
         # Session I/O controls (right side of the same row)
@@ -1028,6 +1128,14 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.dyn_invert.setMaximumHeight(24)
         ctrl_layout5.addWidget(self.dyn_invert)
 
+        self.dyn_decim_spin = QSpinBox()
+        self.dyn_decim_spin.setRange(1, 10000)
+        self.dyn_decim_spin.setValue(1)
+        self.dyn_decim_spin.setToolTip("Downsample fit data; 1=all points, larger values skip more samples")
+        self.dyn_decim_spin.setFixedWidth(60)
+        self.dyn_decim_spin.setMaximumHeight(24)
+        ctrl_layout5.addWidget(wrap_control("Fit Decim:", self.dyn_decim_spin))
+
         # Primary fit actions
         self.btn_dyn = QPushButton("Run Fit")
         self.btn_dyn.setIcon(qta.icon('fa5s.level-down-alt', color=self.accent))
@@ -1056,7 +1164,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         # Clear all fits for selected channel on current event
         self.btn_clear_chan = QPushButton("Clear Chan Fits")
         self.btn_clear_chan.setIcon(qta.icon('fa5s.eraser', color=self.accent))
-        self.btn_clear_chan.setToolTip("Remove all fits for selected channel on this event (Shift+R)")
+        self.btn_clear_chan.setToolTip("Remove all fits for selected channel on this event (Ctrl+R)")
         self.btn_clear_chan.clicked.connect(self.clear_channel_fits)
         self.btn_clear_chan.setFixedWidth(self.unit_width)
         self.btn_clear_chan.setMaximumHeight(24)
@@ -1110,13 +1218,14 @@ class OscilloscopeAnalyzer(QMainWindow):
     def set_controls_enabled(self, enabled):
         widgets = [
             self.event_combo, self.btn_prev, self.btn_next, self.decim_spin,
+            self.btn_coadd,
             self.btn_load_meta, self.btn_meta, self.dist_spin, self.btn_mark_impact,
             self.btn_clear, self.btn_save_fig, self.btn_export, self.btn_import,
             self.btn_clear_data, self.btn_show_info,
             self.btn_sg, self.sg_ch, self.sg_win,
             self.btn_batch_sg, self.btn_clear_sg, self.btn_results_plotter, self.btn_feature_scan, self.btn_fit_filter, self.btn_clear_filter,
             self.dyn_func_combo, self.btn_dyn, self.btn_batch_dyn, self.dyn_ch_combo,
-            self.dyn_invert, self.use_sg_toggle, self.btn_adjust_dyn, self.btn_clear_dyn, self.btn_clear_chan
+            self.dyn_invert, self.dyn_decim_spin, self.use_sg_toggle, self.btn_adjust_dyn, self.btn_clear_dyn, self.btn_clear_chan
         ]
         for w in widgets:
             w.setEnabled(enabled)
@@ -1305,6 +1414,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             except Exception as e:
                 QMessageBox.warning(self, "Load Error", f"Failed to load {os.path.basename(path)}: {e}")
                 continue
+            y = np.asarray(y, dtype=np.float64)
             self.current_data[ch] = (t, y, meta)
 
         if not self.current_data:
@@ -1561,7 +1671,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             # apply decimation
             t_plot = t[::decim]
             y_plot = y[::decim]
-            ax.plot(t_plot, y_plot, color='C0', label=f"Raw CH{ch}")
+            ax.plot(t_plot, y_plot, color=RAW_TRACE_COLOR, linewidth=1.3, label=f"Raw CH{ch}", zorder=2)
             ax.set_ylabel(f"CH{ch} [V]", color=self.fg_color)
             if idx == len(sorted_chs):
                 ax.set_xlabel("Time [s]", color=self.fg_color)
@@ -1713,6 +1823,33 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.canvas.draw()
         self.fit_info_window.update_info(self.results, self.event_combo.currentText())
 
+    def _resolve_fit_color(self, func_name):
+        """Return a consistent color for the requested fit."""
+        key = func_name or "default"
+        existing = self._fit_color_map.get(key)
+        if existing:
+            return existing
+
+        palette = self._fit_color_palette or list(FIT_COLOR_FALLBACK)
+        if not palette:
+            palette = ["#ff7043", "#ab47bc", "#26a69a", "#ef5350"]
+
+        attempts = 0
+        max_attempts = max(len(palette), 1) * 2
+        while attempts < max_attempts:
+            color = palette[self._fit_color_index % len(palette)]
+            self._fit_color_index += 1
+            attempts += 1
+            if color not in self._fit_color_map.values():
+                self._fit_color_map[key] = color
+                return color
+
+        # Fall back to Matplotlib base cycle after palette exhaustion
+        fallback_color = f"C{(self._fit_color_index % 9) + 1}"
+        self._fit_color_index += 1
+        self._fit_color_map[key] = fallback_color
+        return fallback_color
+
     def run_sg_filter(self):
         ch = int(self.sg_ch.currentText()); data = self.current_data.get(ch)
         if data is None:
@@ -1722,9 +1859,10 @@ class OscilloscopeAnalyzer(QMainWindow):
         y_sg = sig.savgol_filter(y, w, 2)
         self.sg_filtered[ch] = (t, y_sg)
         ax = self.figure.axes[sorted(self.current_data).index(ch)]
-        for ln in ax.get_lines():
-            if ln.get_label()=='SG Filter': ax.lines.remove(ln)
-        ax.plot(t, y_sg, color="tab:green", label="SG Filter")
+        for ln in list(ax.get_lines()):
+            if ln.get_label() == 'SG Filter':
+                ax.lines.remove(ln)
+        ax.plot(t, y_sg, label="SG Filter", **SG_FILTER_STYLE)
         ax.legend()
         self.canvas.draw()
         # End run_sg_filter
@@ -1864,6 +2002,11 @@ class OscilloscopeAnalyzer(QMainWindow):
             t_sel, y_sel = t[mask], y[mask]
         else:
             t_sel, y_sel = t, y
+        t_sel = np.asarray(t_sel, dtype=np.float64)
+        y_sel = np.asarray(y_sel, dtype=np.float64)
+        if t_sel.size == 0 or y_sel.size == 0:
+            QMessageBox.warning(self, "No Data", "Selection is empty; adjust the fit window.")
+            return
         # FFT: analysis-only branch; show popup with spectrum and return
         if func_name == "FFT":
             if t_sel.size < 8:
@@ -1874,13 +2017,40 @@ class OscilloscopeAnalyzer(QMainWindow):
             except Exception as e:
                 QMessageBox.warning(self, "FFT Error", str(e))
             return
-        # Only pre-invert selection for functional fits; low_pass_max handles polarity internally
-        if self.dyn_invert.isChecked() and func_name != "low_pass_max":
-            y_sel = -y_sel
+
+        invert_flag = self.dyn_invert.isChecked()
+        y_base = y_sel
+        y_for_fit = -y_base if (invert_flag and func_name != "low_pass_max") else y_base
+
+        # Optional decimation prior to fitting/measurements
+        decim_factor = 1
+        if hasattr(self, "dyn_decim_spin"):
+            try:
+                decim_factor = max(1, int(self.dyn_decim_spin.value()))
+            except Exception:
+                decim_factor = 1
+        if decim_factor > 1:
+            t_fit = t_sel[::decim_factor]
+            y_fit = y_for_fit[::decim_factor]
+            y_base_fit = y_base[::decim_factor]
+        else:
+            t_fit = t_sel
+            y_fit = y_for_fit
+            y_base_fit = y_base
+        min_required = len(names) + 2
+        if func_name == "low_pass_max":
+            min_required = max(min_required, 5)
+        if decim_factor > 1 and t_fit.size < min_required and t_sel.size >= min_required:
+            # Fall back to full data if decimation left too few samples
+            t_fit = t_sel
+            y_fit = y_for_fit
+            y_base_fit = y_base
+        if t_fit.size == 0 or y_fit.size == 0:
+            QMessageBox.warning(self, "No Data", "Selection became empty after decimation.")
+            return
 
         # Special-case measurement that doesn't use curve_fit
         if func_name == "low_pass_max":
-            invert_flag = self.dyn_invert.isChecked()
             # Default width from SG control if present, else 201
             w = int(self.sg_win.value()) if hasattr(self, 'sg_win') else 201
             # If an existing result for this region exists, reuse its width (suppress warnings here)
@@ -1895,19 +2065,19 @@ class OscilloscopeAnalyzer(QMainWindow):
             if w % 2 == 0:
                 w += 1
             # Cap to selection length and ensure odd
-            w = min(w, max(5, len(y_sel) - 1))
+            w = min(w, max(5, len(y_base_fit) - 1))
             if w % 2 == 0:
                 w -= 1
             w = max(5, w)
             # Prepare data (apply invert for picking minima)
-            y_proc = -y_sel if invert_flag else y_sel
+            y_proc = -y_base_fit if invert_flag else y_base_fit
             try:
                 y_f = sig.savgol_filter(y_proc, w, 2)
             except Exception as e:
                 QMessageBox.warning(self, "SG Error", f"Failed to filter: {e}")
                 return
             idx = int(np.argmax(y_f)) if y_f.size else 0
-            t_peak = float(t_sel[idx]) if len(t_sel) else None
+            t_peak = float(t_fit[idx]) if len(t_fit) else None
             val_proc = float(y_f[idx]) if y_f.size else None
             if t_peak is None or val_proc is None:
                 QMessageBox.warning(self, "No Data", "Selection too small for SG filter.")
@@ -1925,7 +2095,10 @@ class OscilloscopeAnalyzer(QMainWindow):
                 idx_num += 1
                 key = f"{base}_{idx_num}"
             label = f"{func_name} {idx_num}" if idx_num > 1 else f"{func_name}"
-            line, = ax.plot([t_peak], [val], marker='o', color='tab:green', label=label)
+            color = self._resolve_fit_color(func_name)
+            line, = ax.plot([t_peak], [val], marker='o', linestyle='None',
+                             color=color, markeredgecolor=color, markerfacecolor=color,
+                             markersize=6, label=label, zorder=4)
             line.set_gid(key)
             if region is not None:
                 ax.axvline(region[0], color="red", linestyle="--", alpha=0.7)
@@ -1946,7 +2119,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             return
 
         # Standard curve_fit path
-        guess, lower, upper = self._guess_params(func_name, names, t_sel, y_sel)
+        guess, lower, upper = self._guess_params(func_name, names, t_fit, y_fit)
         p0 = [guess.get(n, 0.0) for n in names]
         bounds = None
         if any(np.isfinite(lower)) or any(np.isfinite(upper)):
@@ -1958,7 +2131,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.fit_progress.canceled.connect(self._cancel_fit)
         self.fit_progress.show()
 
-        self.fit_worker = FitWorker(func, t_sel, y_sel, p0, bounds)
+        self.fit_worker = FitWorker(func, t_fit, y_fit, p0, bounds)
         current_evt = self.event_combo.currentText()
         self.fit_worker.result.connect(
             lambda popt, err, fn=func_name, nm=names, ch_=ch, reg=region, tt=t_sel, yy=y_sel, ev=current_evt:
@@ -1966,16 +2139,15 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.fit_worker.start()
 
     def _show_fft(self, t_sel, y_sel, ch, evt):
-        # Compute FFT using rfft; detrend and window
+        # Compute FFT using rfft; apply window
         t_sel = np.asarray(t_sel)
         y_sel = np.asarray(y_sel)
         dt = np.median(np.diff(t_sel))
         if not np.isfinite(dt) or dt <= 0:
             raise ValueError("Invalid sampling interval for FFT.")
-        y_dt = y_sel - np.mean(y_sel)
-        n = len(y_dt)
+        n = len(y_sel)
         win = np.hanning(n)
-        y_win = y_dt * win
+        y_win = y_sel * win
         yf = np.fft.rfft(y_win)
         xf = np.fft.rfftfreq(n, dt)
         # Amplitude scaling (two-sided to single-sided)
@@ -2009,21 +2181,240 @@ class OscilloscopeAnalyzer(QMainWindow):
         dlg.resize(700, 450)
         dlg.show()
 
-    def run_batch_fit(self):
-        """Run the selected fit across a user-specified time window and event range."""
-        # Preconditions
-        if not hasattr(self, 'event_files') or not self.event_files:
+    def coadd_waveforms(self):
+        """Prompt for events/channel and combine waveforms."""
+        if not getattr(self, "event_files", None):
             QMessageBox.warning(self, "No Folder", "Select a folder with TRC files first.")
             return
+
+        if getattr(self, "_all_event_keys", None):
+            event_keys = list(self._all_event_keys)
+        else:
+            def _sort_key(val):
+                m = re.search(r"(\d+)$", val)
+                return int(m.group(1)) if m else val
+            event_keys = sorted(self.event_files.keys(), key=_sort_key)
+        if not event_keys:
+            QMessageBox.warning(self, "No Events", "There are no events available to combine.")
+            return
+
+        channel_set = set()
+        for paths in self.event_files.values():
+            for path in paths:
+                m = re.search(r"C(\d+)", os.path.basename(path))
+                if m:
+                    channel_set.add(int(m.group(1)))
+        if not channel_set:
+            QMessageBox.warning(self, "No Channels", "Could not determine available channels for this dataset.")
+            return
+        channel_list = sorted(channel_set)
+
+        default_events = []
+        current_evt = self.event_combo.currentText()
+        if current_evt and current_evt in event_keys:
+            default_events.append(current_evt)
+        elif event_keys:
+            default_events.append(event_keys[0])
+
+        default_channel = None
+        if hasattr(self, "dyn_ch_combo"):
+            try:
+                default_channel = int(self.dyn_ch_combo.currentText())
+            except Exception:
+                default_channel = None
+        if default_channel not in channel_list:
+            default_channel = channel_list[0]
+
+        dlg = WaveformCoaddDialog(
+            self,
+            event_keys,
+            channel_list,
+            default_events=default_events,
+            default_channel=default_channel
+        )
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        try:
+            cfg = dlg.values()
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid Selection", str(e))
+            return
+        self._execute_waveform_coadd(cfg)
+
+    def _execute_waveform_coadd(self, cfg):
+        """Load and combine waveforms based on dialog configuration."""
+        events = cfg.get("events", [])
+        channel = int(cfg.get("channel", 1))
+        mode = str(cfg.get("mode", "average")).lower()
+        overlay = bool(cfg.get("overlay", True))
+
+        used_events = []
+        skipped_events = []
+        aligned_traces = []
+        t_ref = None
+        accum = None
+
+        for evt in events:
+            paths = self.event_files.get(evt)
+            if not paths:
+                skipped_events.append((evt, "event not in folder"))
+                continue
+
+            ch_path = None
+            for path in paths:
+                base = os.path.basename(path)
+                if re.match(fr"C{channel}\D", base):
+                    ch_path = path
+                    break
+            if ch_path is None:
+                skipped_events.append((evt, f"no channel {channel} file"))
+                continue
+
+            try:
+                t_raw, y_raw, _ = self.trc.open(ch_path)
+            except Exception as exc:
+                skipped_events.append((evt, f"load failed: {exc}"))
+                continue
+
+            t = np.asarray(t_raw, dtype=np.float64)
+            y = np.asarray(y_raw, dtype=np.float64)
+            if t.size == 0 or y.size == 0:
+                skipped_events.append((evt, "empty waveform"))
+                continue
+
+            if t_ref is None:
+                t_ref = t.astype(np.float64, copy=True)
+                accum = np.zeros_like(t_ref, dtype=np.float64)
+            else:
+                if len(t) != len(t_ref) or not np.allclose(t, t_ref, rtol=1e-9, atol=1e-12):
+                    try:
+                        y = np.interp(t_ref, t, y)
+                    except Exception as exc:
+                        skipped_events.append((evt, f"alignment failed: {exc}"))
+                        continue
+                else:
+                    y = y.astype(np.float64, copy=True)
+
+            accum += y
+            aligned_traces.append((evt, y))
+            used_events.append(evt)
+
+        if not used_events:
+            QMessageBox.warning(self, "No Waveforms",
+                                f"None of the selected events contained channel {channel}.")
+            return
+
+        if mode == "average":
+            result = accum / len(used_events)
+            mode_label = "average"
+        else:
+            result = accum.copy()
+            mode_label = "sum"
+
+        self._show_coadd_result(t_ref, result, aligned_traces, used_events,
+                                skipped_events, channel, mode_label, overlay)
+
+    def _show_coadd_result(self, t_axis, y_result, aligned_traces, used_events,
+                           skipped_events, channel, mode, overlay):
+        """Display the combined waveform in a popup window."""
+        if t_axis is None or y_result is None:
+            return
+
+        mode_title = "Average" if mode == "average" else "Sum"
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"{mode_title} Waveform • ch{channel}")
+        layout = QVBoxLayout(dlg)
+
+        fig = Figure(figsize=(7, 4))
+        canvas = FigureCanvas(fig)
+        toolbar = NavigationToolbar(canvas, dlg)
+        layout.addWidget(toolbar)
+        ax = fig.add_subplot(111)
+
+        stacked = None
+        stacked_std = None
+        if len(aligned_traces) > 1:
+            stacked = np.vstack([trace for _, trace in aligned_traces])
+            stacked_std = stacked.std(axis=0)
+
+        if overlay and aligned_traces:
+            for evt, trace in aligned_traces:
+                ax.plot(t_axis, trace, color="#888888", alpha=0.35, linewidth=0.8)
+
+        if stacked_std is not None and mode == "average":
+            ax.fill_between(t_axis, y_result - stacked_std, y_result + stacked_std,
+                            color='tab:blue', alpha=0.2, linewidth=0, label="±1σ envelope")
+
+        ax.plot(t_axis, y_result, color='tab:blue', linewidth=2.0,
+                label=f"{mode_title} ({len(used_events)})")
+        ax.set_title(f"{mode_title} of {len(used_events)} event(s) • ch{channel}")
+        ax.set_xlabel("Time [s]")
+        ax.set_ylabel("Voltage [V]")
+        ax.grid(True, alpha=0.4)
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend()
+        fig.tight_layout()
+        layout.addWidget(canvas)
+
+        def _shorten(items, limit=120):
+            text = ", ".join(items)
+            if len(text) <= limit:
+                return text
+            prefix = ", ".join(items[:6])
+            return f"{prefix}, … ({len(items)} total)"
+
+        events_text = _shorten(used_events) if used_events else "None"
+        info_lines = [
+            f"Events combined: {events_text}",
+            f"Combine mode: {mode_title}",
+            f"Channel: {channel}",
+        ]
+
+        peak = float(np.max(y_result))
+        trough = float(np.min(y_result))
+        info_lines.append(f"Peak: {peak:.3e} V   Min: {trough:.3e} V")
+        if t_axis.size > 1:
+            area = float(np.trapz(y_result, t_axis))
+            rms = float(np.sqrt(np.mean(np.square(y_result))))
+            info_lines.append(f"Integral: {area:.3e} V·s   RMS: {rms:.3e} V")
+        if stacked_std is not None and mode == "average":
+            mean_sigma = float(np.mean(stacked_std))
+            info_lines.append(f"Mean point σ: {mean_sigma:.3e} V")
+        if skipped_events:
+            skipped_strings = [f"{evt} ({reason})" for evt, reason in skipped_events]
+            skipped_text = _shorten(skipped_strings, limit=150)
+            info_lines.append(f"Skipped: {skipped_text}")
+
+        info_label = QLabel("\n".join(info_lines))
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Close, parent=dlg)
+        btns.rejected.connect(dlg.reject)
+        btns.accepted.connect(dlg.accept)
+        layout.addWidget(btns)
+
+        dlg.resize(820, 540)
+        self._child_windows.append(dlg)
+        dlg.show()
+
+    def run_batch_fit(self):
+        """Run the selected fit across a user-specified time window and event range."""
+        if not hasattr(self, "event_files") or not self.event_files:
+            QMessageBox.warning(self, "No Folder", "Select a folder with TRC files first.")
+            return
+
         func_name = self.dyn_func_combo.currentText()
         if func_name not in FIT_LIB:
             QMessageBox.warning(self, "No Fit Selected", "Choose a fit function first.")
             return
+
         ch = int(self.dyn_ch_combo.currentText())
         invert_flag = self.dyn_invert.isChecked()
 
-        # Derive defaults for dialog from current selection/loaded data
-        # Build a list of (int_value, key_string) for events to preserve zero padding
+        # Build a sorted list of (int_value, key_string) to preserve zero padding
         ev_pairs = []
         for i in range(self.event_combo.count()):
             key = self.event_combo.itemText(i)
@@ -2035,14 +2426,16 @@ class OscilloscopeAnalyzer(QMainWindow):
                     continue
                 iv = int(m.group(1))
             ev_pairs.append((iv, key))
+
         if not ev_pairs:
             QMessageBox.warning(self, "No Events", "No events found in the current folder.")
             return
+
         ev_pairs.sort(key=lambda x: x[0])
         evt_min = ev_pairs[0][0]
         evt_max = ev_pairs[-1][0]
 
-        # Time defaults: use current region if present for channel, else current trace bounds
+        # Default time window from current selection, if available
         tmin_def = None
         tmax_def = None
         if ch in self.fit_regions:
@@ -2051,16 +2444,30 @@ class OscilloscopeAnalyzer(QMainWindow):
             tt, _, _ = self.current_data[ch]
             tmin_def, tmax_def = float(tt[0]), float(tt[-1])
 
-        dlg = BatchFitDialog(self, evt_min, evt_max, tmin_def, tmax_def)
+        max_threads = max(1, os.cpu_count() or 1)
+        default_threads = getattr(self, "_batch_thread_count", min(4, max_threads))
+
+        dlg = BatchFitDialog(
+            self,
+            evt_min,
+            evt_max,
+            tmin_def,
+            tmax_def,
+            default_threads=default_threads,
+            max_threads=max_threads,
+        )
         if dlg.exec_() != QDialog.Accepted:
             return
+
         try:
-            ev0, ev1, t0_win, t1_win = dlg.values()
+            ev0, ev1, t0_win, t1_win, thread_count = dlg.values()
         except Exception as e:
             QMessageBox.warning(self, "Invalid Input", str(e))
             return
 
-        # Build list of target event KEYS preserving zero-padding
+        thread_count = max(1, int(thread_count))
+        self._batch_thread_count = thread_count
+
         target_events = [key for (iv, key) in ev_pairs if ev0 <= iv <= ev1]
         if not target_events:
             QMessageBox.information(self, "No Events", "No events in the specified range.")
@@ -2068,145 +2475,264 @@ class OscilloscopeAnalyzer(QMainWindow):
 
         func, names = FIT_LIB[func_name]
 
-        # Progress dialog
-        prog = QProgressDialog("Batch fitting...", "Cancel", 0, len(target_events), self)
+        decim_factor = 1
+        if hasattr(self, "dyn_decim_spin"):
+            try:
+                decim_factor = max(1, int(self.dyn_decim_spin.value()))
+            except Exception:
+                decim_factor = 1
+
+        default_sg_window = int(self.sg_win.value()) if hasattr(self, "sg_win") else 201
+
+        dataset_id = self.dataset_id
+        current_event = self.event_combo.currentText()
+        can_plot_current = ch in self.current_data
+        total_events = len(target_events)
+        window_min_samples = len(names) + 3
+
+        guess_params = self._guess_params
+        channel_pattern = re.compile(fr"C{ch}.*")
+        cancel_event = threading.Event()
+
+        prog = QProgressDialog("Batch fitting...", "Cancel", 0, total_events, self)
         prog.setWindowModality(Qt.ApplicationModal)
         prog.setAutoClose(True)
         prog.show()
 
         added = 0
-        # Iterate events
-        for i, evt in enumerate(target_events, start=1):
-            prog.setValue(i - 1)
-            prog.setLabelText(f"Fitting {func_name} ch{ch} on event {evt} ({i}/{len(target_events)})")
-            QApplication.processEvents()
-            if prog.wasCanceled():
-                break
+        any_plot_updates = False
 
-            # Load trace for this event and channel
-            paths = self.event_files.get(evt, [])
+        def _batch_worker(evt_key, paths):
+            if cancel_event.is_set():
+                return {"status": "cancelled", "event": evt_key}
+
             ch_path = None
             for p in paths:
-                base = os.path.basename(p)
-                if re.match(fr"C{ch}.*", base):
+                if channel_pattern.match(os.path.basename(p)):
                     ch_path = p
                     break
             if ch_path is None:
-                # No data for this channel in this event
-                continue
+                return {"status": "skip", "event": evt_key}
 
             try:
-                t, y, meta = self.trc.open(ch_path)
-            except Exception:
-                continue
+                trc_reader = Trc()
+                t, y, _ = trc_reader.open(ch_path)
+                t = np.asarray(t, dtype=np.float64)
+                y = np.asarray(y, dtype=np.float64)
+            except Exception as err:
+                return {"status": "error", "event": evt_key, "error": err}
 
-            # Select window
+            if cancel_event.is_set():
+                return {"status": "cancelled", "event": evt_key}
+
             mask = (t >= t0_win) & (t <= t1_win)
-            t_sel = t[mask]
-            y_sel = y[mask]
-            # If window is invalid for this event, skip
-            if t_sel.size < (len(names) + 3):
-                continue
-            if invert_flag:
-                y_sel = -y_sel
+            t_sel_full = t[mask]
+            y_sel_full = y[mask]
+            if t_sel_full.size < window_min_samples:
+                return {"status": "skip", "event": evt_key}
+
+            y_fit_full = -y_sel_full if (invert_flag and func_name != "low_pass_max") else y_sel_full
+
+            if decim_factor > 1:
+                t_fit = t_sel_full[::decim_factor]
+                y_fit = y_fit_full[::decim_factor]
+                y_base_fit = y_sel_full[::decim_factor]
+            else:
+                t_fit = t_sel_full
+                y_fit = y_fit_full
+                y_base_fit = y_sel_full
 
             if func_name == "low_pass_max":
-                # Measurement path: SG filter and take max (or min if inverted)
-                w = int(self.sg_win.value()) if hasattr(self, 'sg_win') else 201
-                if w % 2 == 0: w += 1
-                w = min(w, max(5, len(y_sel) - 1))
+                min_required = max(len(names) + 2, 5)
+            else:
+                min_required = len(names) + 2
+
+            if decim_factor > 1 and t_fit.size < min_required and t_sel_full.size >= min_required:
+                t_fit = t_sel_full
+                y_fit = y_fit_full
+                y_base_fit = y_sel_full
+
+            if t_fit.size < min_required:
+                return {"status": "skip", "event": evt_key}
+
+            if func_name == "low_pass_max":
+                w = default_sg_window
+                if w % 2 == 0:
+                    w += 1
+                w = min(w, max(5, len(y_base_fit) - 1))
                 if w % 2 == 0:
                     w -= 1
-                y_proc = -y_sel if invert_flag else y_sel
+                y_proc = -y_base_fit if invert_flag else y_base_fit
                 try:
-                    y_f = sig.savgol_filter(y_proc, w, 2)
-                    ii = int(np.argmax(y_f)) if y_f.size else 0
-                    t_peak = float(t_sel[ii]) if len(t_sel) else None
-                    val_proc = float(y_f[ii]) if y_f.size else None
+                    y_filtered = sig.savgol_filter(y_proc, w, 2)
+                    idx = int(np.argmax(y_filtered)) if y_filtered.size else 0
+                    t_peak = float(t_fit[idx]) if t_fit.size else None
+                    val_proc = float(y_filtered[idx]) if y_filtered.size else None
                     if t_peak is None or val_proc is None:
-                        continue
+                        return {"status": "skip", "event": evt_key}
                     val = -val_proc if invert_flag else val_proc
-                except Exception:
+                except Exception as err:
+                    return {"status": "error", "event": evt_key, "error": err}
+
+                payload = {
+                    "status": "ok",
+                    "type": "low_pass_max",
+                    "event": evt_key,
+                    "width": int(w),
+                    "value": float(val),
+                    "t_peak": float(t_peak),
+                }
+                if can_plot_current and evt_key == current_event:
+                    payload["plot_point"] = (float(t_peak), float(val))
+                return payload
+
+            try:
+                guess, lower, upper = guess_params(func_name, names, t_fit, y_fit)
+                p0 = [guess.get(n, 0.0) for n in names]
+                lower_arr = np.asarray(lower, dtype=np.float64)
+                upper_arr = np.asarray(upper, dtype=np.float64)
+                has_bounds = bool(np.isfinite(lower_arr).any() or np.isfinite(upper_arr).any())
+                if has_bounds:
+                    popt, _ = curve_fit(func, t_fit, y_fit, p0=p0, bounds=(lower_arr, upper_arr), maxfev=20000)
+                else:
+                    popt, _ = curve_fit(func, t_fit, y_fit, p0=p0, maxfev=20000)
+            except Exception as err:
+                return {"status": "error", "event": evt_key, "error": err}
+
+            payload = {
+                "status": "ok",
+                "type": "fit",
+                "event": evt_key,
+                "params": tuple(float(v) for v in popt),
+            }
+            if can_plot_current and evt_key == current_event:
+                payload["plot_t"] = t_sel_full
+            return payload
+
+        executor = ThreadPoolExecutor(max_workers=thread_count)
+        futures = {
+            executor.submit(_batch_worker, evt, list(self.event_files.get(evt, []))): evt
+            for evt in target_events
+        }
+
+        try:
+            completed = 0
+            for future in as_completed(futures):
+                evt = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {"status": "error", "event": evt, "error": exc}
+
+                completed += 1
+                prog.setValue(completed)
+                label_evt = result.get("event", evt)
+                prog.setLabelText(f"Fitting {func_name} ch{ch} on event {label_evt} ({completed}/{total_events})")
+                QApplication.processEvents()
+
+                if prog.wasCanceled():
+                    cancel_event.set()
+                    break
+
+                status = result.get("status")
+                if status != "ok":
                     continue
-                base = f"evt_{evt}_{func_name}_ch{ch}"
+
+                evt_key = result["event"]
+                base = f"evt_{evt_key}_{func_name}_ch{ch}"
                 idx = 1
                 key = base
                 while key in self.results:
                     idx += 1
                     key = f"{base}_{idx}"
+
                 rec = {
-                    "params": (int(w),),
-                    "param_names": ["width"],
                     "fit_region": (float(t0_win), float(t1_win)),
-                    "dataset_id": self.dataset_id,
+                    "dataset_id": dataset_id,
                     "inverted": invert_flag,
-                    "value": float(val),
-                    "t_at": float(t_peak),
                 }
-                if self.event_combo.currentText() == evt and ch in self.current_data:
-                    ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
-                    label = f"{func_name} {idx}" if idx > 1 else f"{func_name}"
-                    line, = ax.plot([t_peak], [val], marker='o', color='tab:green', label=label)
-                    line.set_gid(key)
-                    rec["line"] = line
-                    ax.legend()
+
+                if result["type"] == "low_pass_max":
+                    rec.update({
+                        "params": (int(result["width"]),),
+                        "param_names": ["width"],
+                        "value": float(result["value"]),
+                        "t_at": float(result["t_peak"]),
+                    })
+                    if can_plot_current and evt_key == current_event:
+                        ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
+                        label = f"{func_name} {idx}" if idx > 1 else f"{func_name}"
+                        color = self._resolve_fit_color(func_name)
+                        t_peak, val = result.get("plot_point", (result["t_peak"], result["value"]))
+                        line, = ax.plot(
+                            [t_peak],
+                            [val],
+                            marker="o",
+                            linestyle="None",
+                            color=color,
+                            markeredgecolor=color,
+                            markerfacecolor=color,
+                            markersize=6,
+                            label=label,
+                            zorder=4,
+                        )
+                        line.set_gid(key)
+                        rec["line"] = line
+                        ax.legend()
+                        any_plot_updates = True
+                else:
+                    params = result["params"]
+                    rec.update({"params": params, "param_names": names})
+                    if func_name == "QD3Fit":
+                        try:
+                            charge, mass, rad = QD3Cal(params[1], params[2])
+                            rec.update({"charge": charge, "mass": mass, "radius": rad})
+                        except Exception:
+                            pass
+                    elif func_name == "QDMFit":
+                        try:
+                            charge, mass, rad = QDMCal(params[1], params[2])
+                            rec.update({"charge": charge, "mass": mass, "radius": rad})
+                        except Exception:
+                            pass
+
+                    if can_plot_current and evt_key == current_event:
+                        t_plot = result.get("plot_t")
+                        if t_plot is not None and t_plot.size:
+                            ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
+                            y_model = func(t_plot, *params)
+                            if invert_flag and func_name != "low_pass_max":
+                                y_model = -y_model
+                            label = f"{func_name} Fit {idx}" if idx > 1 else f"{func_name} Fit"
+                            color = self._resolve_fit_color(func_name)
+                            line, = ax.plot(
+                                t_plot,
+                                y_model,
+                                color=color,
+                                linewidth=FIT_LINE_WIDTH,
+                                label=label,
+                                zorder=3,
+                            )
+                            line.set_gid(key)
+                            rec["line"] = line
+                            ax.legend()
+                            any_plot_updates = True
+
                 self.results[key] = rec
                 added += 1
-                continue
 
-            # Functional fit path
-            try:
-                guess, lower, upper = self._guess_params(func_name, names, t_sel, y_sel)
-                p0 = [guess.get(n, 0.0) for n in names]
-                bounds = (lower, upper) if (any(np.isfinite(lower)) or any(np.isfinite(upper))) else None
-                if bounds is not None:
-                    popt, _ = curve_fit(func, t_sel, y_sel, p0=p0, bounds=bounds, maxfev=20000)
-                else:
-                    popt, _ = curve_fit(func, t_sel, y_sel, p0=p0, maxfev=20000)
-            except Exception:
-                continue
-            base = f"evt_{evt}_{func_name}_ch{ch}"
-            idx = 1
-            key = base
-            while key in self.results:
-                idx += 1
-                key = f"{base}_{idx}"
-            rec = {
-                "params": tuple(popt),
-                "param_names": names,
-                "fit_region": (float(t0_win), float(t1_win)),
-                "dataset_id": self.dataset_id,
-                "inverted": invert_flag,
-            }
-            if func_name == "QD3Fit":
-                try:
-                    charge, mass, rad = QD3Cal(popt[1], popt[2])
-                    rec.update({"charge": charge, "mass": mass, "radius": rad})
-                except Exception:
-                    pass
-            elif func_name == "QDMFit":
-                try:
-                    charge, mass, rad = QDMCal(popt[1], popt[2])
-                    rec.update({"charge": charge, "mass": mass, "radius": rad})
-                except Exception:
-                    pass
-            if self.event_combo.currentText() == evt and ch in self.current_data:
-                ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
-                y_fit = func(t_sel, *popt)
-                if invert_flag:
-                    y_fit = -y_fit
-                label = f"{func_name} Fit {idx}" if idx > 1 else f"{func_name} Fit"
-                line, = ax.plot(t_sel, y_fit, color='tab:green', label=label)
-                line.set_gid(key)
-                rec["line"] = line
-                ax.legend()
-            self.results[key] = rec
-            added += 1
+            prog.setValue(total_events)
+        finally:
+            cancel_event.set()
+            for fut in futures:
+                fut.cancel()
+            executor.shutdown(wait=False)
 
-        prog.setValue(len(target_events))
-        self.canvas.draw()
-        # Update the info window for the current event
+        if any_plot_updates:
+            self.canvas.draw()
+
         self.fit_info_window.update_info(self.results, self.event_combo.currentText())
+
         if added == 0:
             QMessageBox.information(self, "Batch Complete", "No fits were added. Check time window and channel files.")
         else:
@@ -2257,7 +2783,9 @@ class OscilloscopeAnalyzer(QMainWindow):
             y_fit = -y_fit
         ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
         label = f"{func_name} Fit {idx}" if idx > 1 else f"{func_name} Fit"
-        line, = ax.plot(t_sel, y_fit, color='tab:green', label=label)
+        color = self._resolve_fit_color(func_name)
+        line, = ax.plot(t_sel, y_fit, color=color, linewidth=FIT_LINE_WIDTH,
+                        label=label, zorder=3)
         line.set_gid(key)
         self.results[key]["line"] = line
         ax.legend()
@@ -2340,7 +2868,10 @@ class OscilloscopeAnalyzer(QMainWindow):
             line = rec.get("line")
             if line in ax.lines:
                 line.remove()
-            new_line, = ax.plot([t_peak], [val], marker='o', color='tab:green', label=f"low_pass_max")
+            color = self._resolve_fit_color(func_name)
+            new_line, = ax.plot([t_peak], [val], marker='o', linestyle='None',
+                                 color=color, markeredgecolor=color, markerfacecolor=color,
+                                 markersize=6, label=f"low_pass_max", zorder=4)
             new_line.set_gid(key)
             rec.update({
                 "params": (int(w),),
@@ -2382,13 +2913,16 @@ class OscilloscopeAnalyzer(QMainWindow):
                 y_plot = -y_fit
             else:
                 y_plot = y_fit
+            color = self._resolve_fit_color(func_name)
             if line in ax.lines:
                 line.set_data(t_sel, y_plot)
+                line.set_color(color)
             else:
                 idx_match = re.search(r"_(\d+)$", key)
                 idx = idx_match.group(1) if idx_match else ""
                 label = f"{func_name} Fit {idx}".strip()
-                line, = ax.plot(t_sel, y_plot, color='tab:green', label=label)
+                line, = ax.plot(t_sel, y_plot, color=color, linewidth=FIT_LINE_WIDTH,
+                                 label=label, zorder=3)
                 line.set_gid(key)
             self.canvas.draw_idle()
 
@@ -2505,7 +3039,10 @@ class OscilloscopeAnalyzer(QMainWindow):
             idx_match = re.search(r"_(\d+)$", key)
             idxs = idx_match.group(1) if idx_match else ""
             label = f"{func_name} {idxs}".strip()
-            new_line, = ax.plot([t_peak], [val], marker='o', color='tab:green', label=label)
+            color = self._resolve_fit_color(func_name)
+            new_line, = ax.plot([t_peak], [val], marker='o', linestyle='None',
+                                 color=color, markeredgecolor=color, markerfacecolor=color,
+                                 markersize=6, label=label, zorder=4)
             new_line.set_gid(key)
             rec["line"] = new_line
             if region is not None:
@@ -2528,7 +3065,9 @@ class OscilloscopeAnalyzer(QMainWindow):
         idx_match = re.search(r"_(\d+)$", key)
         idx = idx_match.group(1) if idx_match else ""
         label = f"{func_name} Fit {idx}".strip()
-        new_line, = ax.plot(t_sel, y_fit, color='tab:green', label=label)
+        color = self._resolve_fit_color(func_name)
+        new_line, = ax.plot(t_sel, y_fit, color=color, linewidth=FIT_LINE_WIDTH,
+                             label=label, zorder=3)
         new_line.set_gid(key)
         rec["line"] = new_line
         if region is not None:
@@ -3008,6 +3547,7 @@ class OscilloscopeAnalyzer(QMainWindow):
                     continue
                 try:
                     _, y, _ = self.trc.open(ch_path)
+                    y = np.asarray(y, dtype=np.float64)
                 except Exception:
                     continue
                 sd = float(np.std(y))
