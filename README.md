@@ -1,142 +1,100 @@
 # Oscilloscope Palantir
-GUI tool for interactively analyzing LeCroy `.trc` oscilloscope waveform files, fitting pulses, applying filters, matching external metadata, and exporting results.
 
-## Highlights
-- Load multi‑channel events directly from `.trc` files and auto‑group files by *event id*.
-- Plot raw waveforms with decimation for responsive UI on large traces.
-- Drag‑select a time window per channel to define a fit region.
-- Run model fits (QD3Fit, QDMFit, CSA_pulse, skew_gaussian, gaussian) on the selected region; adjust parameters live.
-- Optional inversion for negative-going pulses.
-- Savitzky–Golay (SG) smoothing overlay per channel; option to run fits/FFT on SG-filtered data.
-- FFT analysis on the selected region (log–log spectrum in a popup with zoom/pan toolbar).
-- Optional metadata matching from a CSV (e.g., velocity/charge/radius fields) once a QD3 fit exists.
-- Export all fit results to a single HDF5 file for downstream analysis.
-- Save the current figure (transparent background supported).
-- Keyboard shortcuts for fast navigation and fitting.
+> **Open Use License**  
+> You may use, copy, modify, and redistribute this repository for any purpose, provided that redistributions include this original source code (including this notice). This software is provided "as is" without warranty of any kind.
 
-## Repo Structure
-- `oscope_palantir.py` — main PyQt5 GUI.
-- `fitparams.py`       — model functions (QD3, QDM, CSA, skew Gaussian), calibration helpers, and the parameter-edit dialog.
-- `readTrcDoner.py`    — compact LeCroy `.trc` reader returning `(time[s], voltage[V], metadata)`.
+## Overview
+Oscilloscope Palantir is a PyQt5 desktop application for reviewing multi-channel LeCroy `.trc` oscilloscope captures, selecting pulse regions, fitting physics-informed models, and exporting the results for downstream PVDF calibration studies. The 2025 builds emphasize fast iteration on large campaigns: every zoom, filter, or fit state is cached per dataset, and auxiliary tools (Results Plotter, feature scans, co-adds, etc.) can be launched without leaving the GUI.
 
-> If you keep additional viewers (e.g., a results HDF5 viewer), place them under a `results_plotter/` directory. This README describes the core GUI.
+## Key Capabilities (2025 release)
+- **Event-aware loader** – Point Palantir at a folder of `.trc` files and it auto-groups channels by event id, tags the dataset path, and remembers per-channel zoom/pan ranges as you step through events.
+- **Persistent axes + Reset Axes** – Manual zoom/pan actions are captured per channel so that subsequent redraws preserve your view; the Reset Axes control clears those saved domains to return to auto-scaling when needed.
+- **Dynamic fitting suite** – Drag out a fit window per channel and run QD3Fit, QDMFit, CSA_pulse, skew_gaussian, gaussian, low_pass_max (SG-based extremum) or FFT from the same control row. Fits can be inverted, batch-applied, adjusted live, and tied to SG-filtered data via the “Use SG” toggle.
+- **Savitzky–Golay pipeline** – Apply SG overlays per channel, batch them across events (multi-threaded), and transparently cache the filtered traces under `.palantir_sg` so they reload instantly when you revisit an event/width pair.
+- **Waveform co-addition** – Combine multiple events on a selected channel (sum or average). The co-add dialog handles interpolation, shows ±1σ envelopes, and can overlay the contributing traces for context.
+- **Metadata + impact tools** – Load an external CSV, run MetaMatch once a QD3/QDM fit exists, and drop an impact-time marker (distance / velocity) across all channels; the computed impact time is stored on the fit record.
+- **Fit management hub** – View every stored fit in the Fit Info window (with dataset scoping), import/export HDF5 files (including event-quality tags), and launch the Results Plotter to make campaign-level scatter plots that link back to the active GUI via event picking.
+- **Event discovery & filtering** – Use Feature Scan (threshold × σ), Fit Filter (param-based queries), Quality Filter (per-event 0–5 ratings), or manual filter application to focus the event list. Filters compound until you hit Clear Filter.
+- **Quality & session context** – Tag each event with a quality score, keep running quality metadata per dataset, and document work via the built-in help dialog and keyboard shortcuts.
+- **Analysis companions** – Additional scripts (thickness, segmentation, penetration, velocity-ratio) consume the exported HDF5 data for publication-ready plots.
 
-## Environment & Installation
-**Recommended:** Python 3.9+ on Windows/macOS/Linux.
+## Repository Map
+- `oscope_palantir.py` – Main PyQt5 GUI with fitting, SG filtering, filtering utilities, axis persistence, and export/import logic.
+- `fitparams.py` – Model definitions, helper functions, and the FitParamsDialog used for manual parameter tweaks.
+- `readTrcDoner.py` – Lightweight `.trc` reader that returns `(time, voltage, metadata)` arrays.
+- `results_plotter.py` – Standalone PyQt tool for visualizing batches of fit results (scatter plots, dataset grouping, event pick linking).
+- `thickness_results.py` – Recreates PVDF thickness comparison plots with propagated uncertainties.
+- `segmented_results.py` – Specialized segmented PVDF calibration plotter for the May 2025 campaigns.
+- `penetration_results.py` – Focused analysis for penetration-only datasets exported from Palantir.
+- `velocity_ratio_vs_radius.py` – Helper for plotting velocity ratios versus particle radius using Palantir exports.
+- `requirements.txt` – Python dependency list (PyQt5, qtawesome, numpy, pandas, scipy, matplotlib, lmfit, etc.).
+- `icon.png`, `palantir.desktop` – Desktop integration assets.
 
-Create and activate a virtual environment (example name: `oscope-palantir`):
+## Installation
+1. Install Python 3.9+ and create a virtual environment:
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate          # Windows: .\.venv\Scripts\activate
+   ```
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. (Optional) Freeze the environment for reproducibility: `pip freeze > requirements.txt`.
+
+## Running the GUI
 ```bash
-python -m venv oscope-palantir
-# Linux/macOS
-source oscope-palantir/bin/activate
-# Windows (PowerShell)
-.\oscope-palantir\Scripts\Activate.ps1
-```
-
-Install dependencies (edit `requirements.txt` as needed):
-```bash
-pip install -r requirements.txt
-# To update the lockfile from the active env:
-pip freeze > requirements.txt
-```
-
-Deactivate the venv when finished:
-```bash
-deactivate
-```
-
-Remove the environment (if needed):
-```bash
-rm -rf oscope-palantir
-```
-
-### Core Python Dependencies
-`PyQt5`, `qtawesome`, `numpy`, `pandas`, `scipy`, `matplotlib`, `lmfit`
-
-## Running the App
-From the project directory (with the venv activated):
-```bash
+source .venv/bin/activate   # if not already active
 python oscope_palantir.py
 ```
+The app uses the Fusion style for consistent rendering across platforms.
 
-## File Naming Assumptions
-- Channels are inferred from filenames beginning with `C1`, `C2`, `C3`, `C4` (case‑insensitive).
-- Files are grouped into *events* by the last `-<digits>.trc` suffix. Example set for event 1042:
-  - `C1-1042.trc`, `C2-1042.trc`, `C3-1042.trc`, `C4-1042.trc`
+## UI Tour & Workflow
+1. **Folder / Event row** – Select a folder (F), navigate events (`,` / `.`), adjust decimation, assign per-event quality (0–5), and—if desired—co-add waveforms across events. Zoom or pan any subplot; the view is remembered per channel until you press **Reset Axes**.
+2. **Session controls** – Clear fits (`E`), clear all data (`Shift+D`), save figures (Ctrl+S, transparent background supported), export/import fits (Ctrl+E / Ctrl+I), and pop open the Fit Info window (`U`).
+3. **Metadata / Impact row** – Load a metadata CSV (`L`), run MetaMatch (`M`), specify detector distance, and drop impact-time markers (`T`) that appear on every channel and persist with the fit record.
+4. **Savitzky–Golay & Discovery row** – Apply SG filters (`S`), choose the channel + window, run SG Batch (Ctrl+B), clear overlays (Shift+S), reset axes, and launch:
+   - **Results Plotter** (`P`) for dataset-level charts,
+   - **Feature Scan** (Ctrl+F) to search large event ranges for peaks,
+   - **Fit Filter** (Ctrl+Shift+F) for param-based queries,
+   - **Quality Filter** for rating-based filtering,
+   - **Clear Filter** (Ctrl+K) to restore the full event list.
+5. **Dynamic fit row** – Choose the model (QD3/QDM/CSA/skew/gauss/low_pass_max/FFT), channel, invert toggle, and decimation for fit math. Run (Enter), adjust (`A`), clear (`R`), clear all fits on a channel (Shift+R), batch process (`B`), or force the fit/FFT to use any cached SG trace (`Ctrl+Shift+S`). FFT results open in a separate window with its own NavigationToolbar.
 
-## Typical Workflow
-1. **Select Folder** containing `.trc` files. The app discovers all events and populates the event dropdown.
-2. **Pick an event**; all available channels for that event are plotted.
-3. (Optional) **Set Decimation** to plot every *N*th sample for speed.
-4. **Drag‑select** a fit region on a channel (orange overlay). You can select different regions per channel.
-5. Choose a **Fit Function** and **Channel**, optionally **Invert**, then press **Run Fit**.
-6. Use **Adjust Fit** to tweak parameters and instantly update the overlay.
-7. (Optional) **SG Filter**: Choose a channel and window width, then apply/clear the SG overlay. Enable **Use SG** in the dynamic row to run fits/FFT on the filtered data.
-8. (Optional) **Load Metadata** CSV and run **MetaMatch** to associate a fitted event with a metadata row (e.g., by time & velocity).
-9. **Export Fits** to HDF5 or **Save Figure** for reporting.
+Typical workflow:
+- Select a folder, optionally apply SG filtering, drag-select a region (orange span) per channel, then run fits. Repeat for the channels of interest, review parameters/derived charge + mass in the Fit Info window, mark impacts, and export to HDF5 when satisfied.
 
-## Fit Models (Parameters)
-- **QD3Fit(t, t0, q, v, C)** — Piecewise transient with smoothing; parameters include time offset `t0`, scale `q`, velocity proxy `v`, and offset `C`.
-- **QDMFit(t, t0, q, v, C)** — Variant with different geometry/time constants and smoothing; same parameter names.
-- **CSA_pulse(t, t0, C0, C1, C2, T0, T1, T2, C)** — Charge-sensitive amplifier‑like response with pre/post behavior and baseline.
-- **skew_gaussian(x, A, xi, omega, alpha, C)** — Azzalini skew‑Gaussian; `A` (area), `xi` (location), `omega` (scale), `alpha` (skew), `C` (offset).
+## Analysis, Filtering, & Persistence
+- **Axis persistence** – Every subplot records its x/y limits after mouse zoom, pan, or scroll; those limits are reapplied when the event redraws, enabling apples-to-apples comparisons across events. Reset Axes wipes the cached limits.
+- **SG caching** – Filtered traces are cached per dataset/event/channel/window in `.palantir_sg`. Clearing the SG overlay removes the cache for that entry; deleting the folder resets everything.
+- **Feature Scan** – Define an event range, channel, σ-multiplier, and absolute/positive-only mode. The scanner loads each waveform, computes σ, and flags events whose peaks exceed the threshold. Apply the resulting filter list or rescan with new settings.
+- **Fit Filter** – Query stored fits (current dataset aware) by model, channel, parameter, and comparison (>, between, etc.). The resulting event list can be inspected before filtering the dropdown.
+- **Quality filter** – Rate events with the Quality spin box, then filter to those ≥ a chosen score. Ratings are saved in-memory and exported with your fits.
+- **Manual filters** – All filters compound. The Clear Filter command restores the original event order maintained in `_all_event_keys`.
+- **Fit Info window** – Tabular summary of every saved fit, including derived metrics (charge, mass, radius, SG metadata). Toggle “Only current dataset” as needed.
+- **Results Plotter** – Opens a dedicated PyQt window that builds scatter plots/histograms from the current in-memory fits. Picking an event in the plotter jumps the main GUI to that event (if present).
+- **Import/Export** – HDF5 exports include fit parameters, derived values, fit regions, inversion flags, SG context, dataset id, and event quality table. Imports merge with in-memory results so you can pick up where a previous session ended.
+- **Impact tracking** – Mark Impact uses distance/velocity to compute a predicted impact time, plots the vertical marker on every channel, and stores the value on the associated fit record for export.
 
-### Initial Guessing & Bounds
-The app computes heuristic initial guesses from the selected region (e.g., rise/fall indices, area under the curve). Bounds ensure physically meaningful values (e.g., `v ≥ 0`).
+## Secondary Analysis Workflows
+After exporting fits you can:
+- Run `results_plotter.py` independently to compare datasets or generate publication plots without the GUI.
+- Use `thickness_results.py`, `segmented_results.py`, `penetration_results.py`, or `velocity_ratio_vs_radius.py` to recreate the PVDF charge-yield figures used in recent campaigns. Each script expects a Palantir HDF5 export and focuses on a specific derived metric (thickness sweep, segmented witness plates, penetration-only subsets, or velocity ratio vs radius respectively).
 
-### Calibration Helpers
-For QD3/QDM fits, the app derives approximate **charge**, **mass**, and **radius** from fitted `q` and `v`. Density can be changed in code; default assumes ~7500 kg/m³.
-
-## Metadata Matching
-- Load a CSV with columns like `UTC Timestamp`, `Local Time`, `Velocity (m/s)`, `Charge (C)`, `Radius (m)`, etc.
-- MetaMatch constructs a timestamp from the `.trc` trigger time and looks for rows within ±1 s, then chooses the closest by velocity (±8% tolerance).
-
-> Tip: Run a QD3 fit first; MetaMatch requires `v` from a QD3 result.
-
-## Exported Data (HDF5)
-**Menu:** *Export Fits* → choose a destination HDF5 file. The tool writes a single table `/fits` with one row per fit. Columns include:
-- `event`, `channel`, `fit_type`
-- QD3/QDM: `t0`, `q`, `v`, `C`, derived `charge`, `mass`, `radius`, optional `impact_time`
-- CSA: `t0`, `C0`, `C1`, `C2`, `T0`, `T1`, `T2`, `C`
-- Additionally, the stored fit **region** and **inversion flag** are retained internally and reapplied when recalling fits for an event.
-
-> You can open the HDF5 in Python (pandas) to post‑process, filter, or plot fits across a run.
-
-## Keyboard Shortcuts
-- Navigation: `,` (Prev), `.` (Next), `T` (Mark Impact)
-- Files: `F` (Select Folder), `Ctrl+S` (Save), `Ctrl+E` (Export), `Ctrl+I` (Load), `Shift+D` (Clear Data)
-- Meta: `L` (Load Metadata), `M` (MetaMatch)
-- SG/Filters: `S` (SG Filter), `Ctrl+B` (SG Batch), `Shift+S` (Clear SG), `P` (Results Plotter), `Ctrl+F` (Feature Scan), `Ctrl+Shift+F` (Fit Filter), `Ctrl+K` (Clear Filter)
-- Dynamic fits: `Enter` (Run), `A` (Adjust), `R` (Clear Fit), `Shift+R` (Clear Chan Fits), `B` (Batch), `Ctrl+Shift+S` (Toggle Use SG)
-- Fit selection: `Q` (QD3Fit), `D` (QDMFit), `C` (CSA), `W` (skew_gaussian), `G` (gaussian), `X` (low_pass_max)
-- Channel select: `1–8`; Invert: `I`
-- Info: `H` (Help), `U` (Fit Info)
-
-## Notes & Tips
-- **Decimation** only affects plotting; fits always use the full‑resolution samples inside the selected region.
-- **Transparent figures:** Use **Save Figure** to export with a transparent background (useful for posters).
-- **Multiple fits per event/channel:** The app supports multiple fits; each new run gets a unique suffix and is tracked in the **Fit Info** window.
-- **FFT:** Select a region, choose FFT in the dynamic dropdown, and Run. The popup uses log–log scales with a pan/zoom toolbar.
-- **Use SG:** When enabled (and an SG overlay exists for the channel), Run Fit / Adjust Fit / FFT operate on the SG‑filtered signal instead of raw.
-
-## Known Limitations / Roadmap
-- Fit info display can lag after switching back to waveform.
-- Batch SG/fit processing is partially implemented.
-- Displayed fit should be selectable per channel when >1 are shown.
-- Auto‑region suggestion around rise/fall for QD3/CSA in batch mode.
-- Package the app and pin a cross‑platform dependency set.
+## Keyboard Shortcuts (abbreviated)
+- **Navigation** – `,` / `.` (prev/next), `T` (Mark Impact)
+- **Files & session** – `F` (folder), `Ctrl+S` (save figure), `Ctrl+E` (export), `Ctrl+I` (import), `Shift+D` (clear data)
+- **Metadata** – `L` (load CSV), `M` (MetaMatch)
+- **SG & filters** – `S` (SG), `Ctrl+B` (batch SG), `Shift+S` (clear SG), `P` (Results Plotter), `Ctrl+F` (Feature Scan), `Ctrl+Shift+F` (Fit Filter), `Ctrl+K` (Clear Filter)
+- **Fitting** – `Enter` (run), `A` (adjust), `R` (clear fit), `Shift+R` (clear channel fits), `B` (batch), `Ctrl+Shift+S` (Use SG), `Q/D/C/W/G/X` (model select), number keys (channel), `I` (invert)
+- **Info** – `H` (help), `U` (Fit Info)
 
 ## Troubleshooting
-- **“No Files”**: Verify the folder has `.trc` files with names like `C1-####.trc`.
-- **Event dropdown is empty**: Filenames must end with `-<digits>.trc`.
-- **MetaMatch requires a QD3 fit**: Run QD3 before MetaMatch to provide a velocity.
-- **SG window too large**: Reduce the SG width to less than the number of samples in the trace.
+- **No events listed** – Ensure filenames end with `-<digits>.trc` (e.g., `C3-1042.trc`).
+- **No channel detected** – File names must begin with `C1`–`C4`. Mixed casing is tolerated.
+- **Feature/fit filters return nothing** – Clear filters (Ctrl+K) to restore the base event list, then re-run with less restrictive criteria.
+- **MetaMatch unavailable** – Run a QD3 or QDM fit first; `v` from that fit seeds the metadata lookup.
+- **SG cache issues** – Delete the `.palantir_sg` folder inside the dataset directory to force a fresh SG run.
 
-## License / Credits
-- `.trc` reading logic adapted from public LeCroy waveform templates (see comments in `readTrcDoner.py`).
-
-- Core contributors: Alex Doner and collaborators.
-
----
-*Questions or ideas? Message Alex at Alex.doner@lasp.colorado.edu.
-
+## Contact
+Questions or ideas? Message Alex at `Alex.doner@lasp.colorado.edu`.

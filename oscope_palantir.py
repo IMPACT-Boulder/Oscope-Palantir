@@ -1,3 +1,9 @@
+# Open Use License
+#
+# You may use, copy, modify, and redistribute this file for any purpose,
+# provided that redistributions include this original source code (including this notice).
+# This software is provided "as is" without warranty of any kind.
+
 """
 Oscilloscope Palantir
 ----------------------
@@ -19,7 +25,7 @@ from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRegExp
 from PyQt5.QtGui import QRegExpValidator, QKeySequence
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QDoubleSpinBox, QSpinBox,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QDoubleSpinBox, QSpinBox,
     QPushButton, QComboBox, QFileDialog, QMessageBox, QLabel, QCheckBox, QDialog, QInputDialog,
     QProgressDialog, QSizePolicy, QTableWidget, QTableWidgetItem, QLineEdit, QDialogButtonBox,
     QListWidget, QListWidgetItem)
@@ -58,7 +64,7 @@ FIT_LIB = {
     # Analysis-only utility: compute and plot FFT of selection in a popup
     "FFT": (None, []),
     # Special measurement: Savitzky–Golay low-pass then take max (invert -> min)
-    "low_pass_max": (None, ["width"])  # width = SG window samples (odd)
+    "low_pass_max": (None, ["width", "baseline_slope", "baseline_intercept"])  # width = SG window samples (odd)
 }
 
 # Consistent styling for traces, filters, and fits
@@ -200,6 +206,8 @@ class FitInfoWindow(QWidget):
                 if "impact_time" in rec: row["impact_time"] = rec["impact_time"]
                 if "radius" in rec: row["radius"] = rec["radius"]
                 if "value" in rec: row["value"] = rec["value"]
+                if "value_raw" in rec: row["value_raw"] = rec["value_raw"]
+                if "baseline" in rec: row["baseline"] = rec["baseline"]
                 if "t_at" in rec: row["t_at"] = rec["t_at"]
     
             records.append(row)
@@ -259,6 +267,9 @@ class SciFitParamsDialog(QDialog):
         self._bounds = bounds
         self._editors = {}
         self._last_valid = dict(params_dict)
+        self._last_cov = None
+        self._t_sel = np.asarray(t_sel, dtype=np.float64)
+        self._y_sel = np.asarray(y_sel, dtype=np.float64)
 
         main = QVBoxLayout(self)
         form = QGridLayout()
@@ -302,6 +313,7 @@ class SciFitParamsDialog(QDialog):
             # Live update and consistent formatting on finish
             le.textChanged.connect(self._maybe_emit)
             le.editingFinished.connect(lambda n=name: self._reformat(n))
+            le.textEdited.connect(self._invalidate_covariance)
 
         # Buttons 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
@@ -311,8 +323,18 @@ class SciFitParamsDialog(QDialog):
         # --- Extra buttons (match v2 behavior) ---
         self.btn_plot  = QPushButton("Plot")
         self.btn_refit = QPushButton("Refit")
-        #main.addWidget(self.btn_plot)
-        main.addWidget(self.btn_refit)
+        self.btn_refit.setToolTip("Run curve_fit from current values to update parameters and covariance.")
+        self.btn_cov = QPushButton("Update Covariance")
+        self.btn_cov.setToolTip("Estimate covariance using the current parameter values without changing them.")
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.btn_refit)
+        btn_row.addWidget(self.btn_cov)
+        btn_row.addStretch()
+        main.addLayout(btn_row)
+        self.cov_status = QLabel()
+        self.cov_status.setStyleSheet("color: #888;")
+        main.addWidget(self.cov_status)
+        self._update_cov_status("none")
 
         # Clicking Plot just emits current params (useful if validation passed)
         self.btn_plot.clicked.connect(self._maybe_emit)
@@ -328,9 +350,9 @@ class SciFitParamsDialog(QDialog):
             p0 = [parsed[n] for n in self._names]
             try:
                 if self._bounds is not None:
-                    popt, _ = _curve_fit(self._func, _np.array(t_sel), _np.array(y_sel), p0=p0, bounds=self._bounds, maxfev=20000)
+                    popt, pcov = _curve_fit(self._func, _np.array(t_sel), _np.array(y_sel), p0=p0, bounds=self._bounds, maxfev=20000)
                 else:
-                    popt, _ = _curve_fit(self._func, _np.array(t_sel), _np.array(y_sel), p0=p0, maxfev=20000)
+                    popt, pcov = _curve_fit(self._func, _np.array(t_sel), _np.array(y_sel), p0=p0, maxfev=20000)
             except Exception as e:
                 QMessageBox.warning(self, "Refit failed", str(e))
                 return
@@ -343,8 +365,24 @@ class SciFitParamsDialog(QDialog):
                         le.setText(f"{float(v):.{self._precision}e}")
                     finally:
                         le.blockSignals(False)
+            self._last_cov = pcov
+            self._update_cov_status("ok")
             self._maybe_emit()
         self.btn_refit.clicked.connect(_do_refit)
+
+        def _update_covariance_only():
+            parsed = self._parse_all()
+            if parsed is None:
+                QMessageBox.warning(self, "Invalid input", "Please correct parameter values before updating covariance.")
+                return
+            params_vec = np.array([parsed[n] for n in self._names], dtype=np.float64)
+            cov = self._compute_covariance_numeric(params_vec)
+            if cov is None:
+                QMessageBox.warning(self, "Covariance Error", "Failed to compute covariance for the current parameters.")
+                return
+            self._last_cov = cov
+            self._update_cov_status("ok")
+        self.btn_cov.clicked.connect(_update_covariance_only)
     
         # Initial emit
         self._maybe_emit()
@@ -370,6 +408,70 @@ class SciFitParamsDialog(QDialog):
             le.blockSignals(False)
         except Exception:
             pass
+
+    def _invalidate_covariance(self):
+        self._last_cov = None
+        self._update_cov_status("stale")
+
+    def _update_cov_status(self, state: str):
+        if not hasattr(self, "cov_status") or self.cov_status is None:
+            return
+        if state == "ok":
+            self.cov_status.setText("Covariance: up to date")
+            self.cov_status.setStyleSheet("color: #2e7d32;")
+        elif state == "stale":
+            self.cov_status.setText("Covariance: needs recompute")
+            self.cov_status.setStyleSheet("color: #f57c00;")
+        else:
+            self.cov_status.setText("Covariance: not computed")
+            self.cov_status.setStyleSheet("color: #888;")
+
+    def getCovariance(self):
+        if self._last_cov is None:
+            return None
+        try:
+            return np.array(self._last_cov, copy=True)
+        except Exception:
+            return None
+
+    def _compute_covariance_numeric(self, params_vec):
+        if self._t_sel is None or self._y_sel is None or self._t_sel.size == 0:
+            return None
+        t_arr = self._t_sel
+        y_arr = self._y_sel
+        try:
+            base = self._func(t_arr, *params_vec)
+        except Exception:
+            return None
+        residual = y_arr - np.asarray(base, dtype=np.float64)
+        n = residual.size
+        m = len(params_vec)
+        if m == 0 or n == 0:
+            return None
+        dof = max(1, n - m) if n > m else max(1, n - 1)
+        sigma2 = float(np.dot(residual, residual) / dof)
+        eps = np.sqrt(np.finfo(float).eps)
+        jac = np.zeros((n, m), dtype=np.float64)
+        for idx in range(m):
+            step = eps * max(1.0, abs(params_vec[idx]))
+            if not np.isfinite(step) or step == 0.0:
+                step = eps
+            params_hi = params_vec.copy()
+            params_lo = params_vec.copy()
+            params_hi[idx] += step
+            params_lo[idx] -= step
+            try:
+                f_hi = np.asarray(self._func(t_arr, *params_hi), dtype=np.float64)
+                f_lo = np.asarray(self._func(t_arr, *params_lo), dtype=np.float64)
+            except Exception:
+                return None
+            jac[:, idx] = (f_hi - f_lo) / (2.0 * step)
+        try:
+            jt_j = jac.T @ jac
+            jt_j_inv = np.linalg.pinv(jt_j)
+            return sigma2 * jt_j_inv
+        except Exception:
+            return None
 
     def _maybe_emit(self):
         parsed = self._parse_all()
@@ -460,6 +562,63 @@ class BatchFitDialog(QDialog):
             raise ValueError("End Event must be >= Start Event")
         threads = int(self.thread_spin.value())
         return ev0, ev1, t0, t1, threads
+
+class SGBatchDialog(QDialog):
+    """Configuration dialog for running SG filtering across multiple events."""
+
+    def __init__(self, parent, evt_min, evt_max, default_threads=1, max_threads=None):
+        super().__init__(parent)
+        self.setWindowTitle("SG Batch Configuration")
+
+        layout = QVBoxLayout(self)
+        grid = QGridLayout()
+        layout.addLayout(grid)
+
+        grid.addWidget(QLabel("Start Event"), 0, 0)
+        self.start_evt = QLineEdit(str(evt_min))
+        grid.addWidget(self.start_evt, 0, 1)
+
+        grid.addWidget(QLabel("End Event"), 1, 0)
+        self.end_evt = QLineEdit(str(evt_max))
+        grid.addWidget(self.end_evt, 1, 1)
+
+        self.overwrite_chk = QCheckBox("Overwrite cached filters")
+        self.overwrite_chk.setToolTip("When unchecked, skip events that already have cached SG data")
+        layout.addWidget(self.overwrite_chk)
+
+        grid_threads = QGridLayout()
+        layout.addLayout(grid_threads)
+        grid_threads.addWidget(QLabel("Worker Threads"), 0, 0)
+        self.thread_spin = QSpinBox()
+        max_threads = max_threads or max(1, os.cpu_count() or 1)
+        self.thread_spin.setRange(1, max_threads)
+        try:
+            default_threads = int(default_threads)
+        except Exception:
+            default_threads = 1
+        default_threads = max(1, min(default_threads, max_threads))
+        self.thread_spin.setValue(default_threads)
+        self.thread_spin.setToolTip("Number of parallel workers for SG filtering")
+        grid_threads.addWidget(self.thread_spin, 0, 1)
+
+        note = QLabel("Uses the SG channel + window configured on the main toolbar.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def values(self):
+        try:
+            ev0 = int(self.start_evt.text().strip())
+            ev1 = int(self.end_evt.text().strip())
+        except Exception:
+            raise ValueError("Invalid event range")
+        if ev1 < ev0:
+            raise ValueError("End Event must be >= Start Event")
+        return ev0, ev1, self.overwrite_chk.isChecked(), int(self.thread_spin.value())
 
 
 class WaveformCoaddDialog(QDialog):
@@ -695,14 +854,60 @@ class FitFilterDialog(QDialog):
         # Update parameter list when fit type changes, and show/hide second threshold
         def refresh_params():
             fit_name = self.fit_combo.currentText()
-            # Start with known params from FIT_LIB
-            base = []
-            if fit_name in FIT_LIB:
-                base = list(FIT_LIB[fit_name][1])
-            # Add known derived fields that may be present in records
-            derived = ["charge", "mass", "radius", "impact_time"]
+            base_names = list(FIT_LIB.get(fit_name, (None, []))[1])
+            ordered = []
+            seen = set()
+
+            def _add_base(name):
+                name = str(name).strip()
+                if not name or name in seen:
+                    return
+                seen.add(name)
+                ordered.append(name)
+
+            for nm in base_names:
+                _add_base(nm)
+
+            dynamic = set()
+            parent_widget = self.parent()
+            if parent_widget is not None and hasattr(parent_widget, "results"):
+                ds_cur = getattr(parent_widget, "dataset_id", None)
+                pattern = re.compile(r'^evt_(\d+)_(.+)_ch(\d+)(?:_\d+)?$')
+                for key, rec in getattr(parent_widget, "results", {}).items():
+                    m = pattern.match(key)
+                    if not m or m.group(2) != fit_name:
+                        continue
+                    ds_rec = rec.get("dataset_id")
+                    if ds_cur is not None and ds_rec is not None and str(ds_rec) != str(ds_cur):
+                        continue
+                    for nm in rec.get("param_names", []):
+                        nm = str(nm).strip()
+                        if nm and nm not in seen:
+                            dynamic.add(nm)
+                    skip_keys = {"params", "param_names", "line", "dataset_id", "fit_region", "inverted"}
+                    for k, v in rec.items():
+                        if k in skip_keys:
+                            continue
+                        if isinstance(v, (bool, np.bool_)):
+                            continue
+                        if isinstance(v, (np.integer, np.floating, int, float)):
+                            name = str(k).strip()
+                            if name and name not in seen:
+                                dynamic.add(name)
+            for nm in sorted(dynamic, key=lambda s: s.lower()):
+                if nm not in seen:
+                    seen.add(nm)
+                    ordered.append(nm)
+
+            if not ordered:
+                fallback = ["value"]
+                for nm in fallback:
+                    if nm not in seen:
+                        ordered.append(nm)
+                        seen.add(nm)
+
             self.param_combo.clear()
-            self.param_combo.addItems(base + derived)
+            self.param_combo.addItems(ordered)
         def refresh_op():
             is_between = (self.op_combo.currentText() == "between")
             self.thr2_row_lbl.setVisible(is_between)
@@ -761,12 +966,12 @@ class FitWorker(QThread):
 
         try:
             if self.bounds is not None:
-                popt, _ = curve_fit(wrapped, self.t_sel, self.y_sel, p0=self.p0,
-                                    bounds=self.bounds, maxfev=20000)
+                popt, pcov = curve_fit(wrapped, self.t_sel, self.y_sel, p0=self.p0,
+                                       bounds=self.bounds, maxfev=20000)
             else:
-                popt, _ = curve_fit(wrapped, self.t_sel, self.y_sel, p0=self.p0,
-                                    maxfev=20000)
-            self.result.emit(popt, None)
+                popt, pcov = curve_fit(wrapped, self.t_sel, self.y_sel, p0=self.p0,
+                                       maxfev=20000)
+            self.result.emit((popt, pcov), None)
         except Exception as e:
             self.result.emit(None, e)
 
@@ -778,6 +983,8 @@ class OscilloscopeAnalyzer(QMainWindow):
         self._all_event_keys = []
         self.feature_filter_active = False
         self.feature_filter_keys = []
+        self.event_quality = {}
+        self._quality_spin_guard = False
 
         self.setWindowTitle("Oscilloscope Waveform Analyzer")
         self.setGeometry(100, 100, 1500, 900)
@@ -793,11 +1000,20 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.fit_regions     = {}
         self.span_selectors  = {}
         self.sg_filtered     = {}
+        self.sg_filtered_meta = {}
+        self.sg_cache_dir    = None
+        # Persist user-defined axis limits per channel between event redraws
+        self.channel_axis_limits = {}
+        self._suspend_axis_capture = False
         self.metaArr         = None
         self._fit_color_map  = dict(FIT_COLOR_PRESETS)
         self._fit_color_palette = list(FIT_COLOR_FALLBACK)
         self._fit_color_index = 0
         self._child_windows  = []  # keep references to child windows (e.g., Results Plotter)
+        cpu_threads = max(1, os.cpu_count() or 1)
+        self._sg_batch_thread_count = min(4, cpu_threads)
+        self._axis_to_channel = {}
+        self._axis_event_ids = []
 
         def wrap_control(label_text, control):
             w = QWidget()
@@ -839,6 +1055,17 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.event_combo.setFixedWidth(self.unit_width)
         ctrl_layout.addWidget(self.event_combo)
 
+        self.quality_spin = QSpinBox()
+        self.quality_spin.setRange(0, 5)
+        self.quality_spin.setValue(0)
+        self.quality_spin.setToolTip("Assign quality 1-5 to current event (0 = unset)")
+        self.quality_spin.valueChanged.connect(self._on_quality_changed)
+        ctrl_layout.addWidget(wrap_control("Quality", self.quality_spin))
+
+        self.quality_hint = QLabel("Use Quality to tag current event (auto-saved per dataset).")
+        self.quality_hint.setStyleSheet("font-size: 11px; color: #999999;")
+        ctrl_layout.addWidget(self.quality_hint)
+
         # Label to display the currently selected source folder
         self.folder_label = QLabel("Select Folder To Continue")
         self.folder_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -856,6 +1083,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         btn_help.clicked.connect(self.show_help)
         btn_help.setFixedWidth(self.unit_width)
         ctrl_layout.addWidget(btn_help)
+        ctrl_layout.addSpacing(2)
 
         # Theme toggle
         self.btn_theme = QPushButton("Light Mode")
@@ -1053,6 +1281,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_batch_sg.setToolTip("Run SG filter on all events (Ctrl+B)")
         self.btn_batch_sg.setFixedWidth(self.unit_width)
         self.btn_batch_sg.setMaximumHeight(24)
+        self.btn_batch_sg.clicked.connect(self.run_batch_sg_filter)
         sg_layout.addWidget(self.btn_batch_sg)
 
         # Button to clear
@@ -1063,6 +1292,14 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_clear_sg.setFixedWidth(self.unit_width)
         self.btn_clear_sg.setMaximumHeight(24)
         sg_layout.addWidget(self.btn_clear_sg)
+
+        self.btn_reset_axes = QPushButton("Reset Axes")
+        self.btn_reset_axes.setIcon(qta.icon('fa5s.expand', color=self.accent))
+        self.btn_reset_axes.setToolTip("Clear saved axis limits and return to auto-scaling")
+        self.btn_reset_axes.setFixedWidth(self.unit_width)
+        self.btn_reset_axes.setMaximumHeight(24)
+        self.btn_reset_axes.clicked.connect(lambda: self.reset_axis_limits())
+        sg_layout.addWidget(self.btn_reset_axes)
 
         # Right-aligned scanning/filtering controls on same row
         sg_layout.addStretch()
@@ -1090,6 +1327,14 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_fit_filter.setMaximumHeight(24)
         self.btn_fit_filter.clicked.connect(self.run_fit_filter)
         sg_layout.addWidget(self.btn_fit_filter)
+
+        self.btn_quality_filter = QPushButton("Quality Filter")
+        self.btn_quality_filter.setIcon(qta.icon('fa5s.star', color=self.accent))
+        self.btn_quality_filter.setToolTip("Filter events with quality ≥ threshold")
+        self.btn_quality_filter.setFixedWidth(self.unit_width)
+        self.btn_quality_filter.setMaximumHeight(24)
+        self.btn_quality_filter.clicked.connect(self.run_quality_filter)
+        sg_layout.addWidget(self.btn_quality_filter)
 
         self.btn_clear_filter = QPushButton("Clear Filter")
         self.btn_clear_filter.setIcon(qta.icon('fa5s.undo', color=self.accent))
@@ -1137,6 +1382,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         ctrl_layout5.addWidget(wrap_control("Fit Decim:", self.dyn_decim_spin))
 
         # Primary fit actions
+        ctrl_layout5.addSpacing(2)
         self.btn_dyn = QPushButton("Run Fit")
         self.btn_dyn.setIcon(qta.icon('fa5s.level-down-alt', color=self.accent))
         self.btn_dyn.setToolTip("Execute selected fit (Return)")
@@ -1164,7 +1410,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         # Clear all fits for selected channel on current event
         self.btn_clear_chan = QPushButton("Clear Chan Fits")
         self.btn_clear_chan.setIcon(qta.icon('fa5s.eraser', color=self.accent))
-        self.btn_clear_chan.setToolTip("Remove all fits for selected channel on this event (Ctrl+R)")
+        self.btn_clear_chan.setToolTip("Remove all fits for selected channel on this event (Shift+R)")
         self.btn_clear_chan.clicked.connect(self.clear_channel_fits)
         self.btn_clear_chan.setFixedWidth(self.unit_width)
         self.btn_clear_chan.setMaximumHeight(24)
@@ -1194,6 +1440,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.figure = Figure()
         self.canvas = FigureCanvas(self.figure)
         layout.addWidget(self.canvas)
+        self._connect_axis_event_hooks()
         self.toolbar = NavigationToolbar(self.canvas, self)
         layout.addWidget(self.toolbar)
 
@@ -1217,13 +1464,13 @@ class OscilloscopeAnalyzer(QMainWindow):
 
     def set_controls_enabled(self, enabled):
         widgets = [
-            self.event_combo, self.btn_prev, self.btn_next, self.decim_spin,
+            self.event_combo, self.btn_prev, self.btn_next, self.decim_spin, self.quality_spin,
             self.btn_coadd,
             self.btn_load_meta, self.btn_meta, self.dist_spin, self.btn_mark_impact,
             self.btn_clear, self.btn_save_fig, self.btn_export, self.btn_import,
             self.btn_clear_data, self.btn_show_info,
             self.btn_sg, self.sg_ch, self.sg_win,
-            self.btn_batch_sg, self.btn_clear_sg, self.btn_results_plotter, self.btn_feature_scan, self.btn_fit_filter, self.btn_clear_filter,
+            self.btn_batch_sg, self.btn_clear_sg, self.btn_reset_axes, self.btn_results_plotter, self.btn_feature_scan, self.btn_fit_filter, self.btn_quality_filter, self.btn_clear_filter,
             self.dyn_func_combo, self.btn_dyn, self.btn_batch_dyn, self.dyn_ch_combo,
             self.dyn_invert, self.dyn_decim_spin, self.use_sg_toggle, self.btn_adjust_dyn, self.btn_clear_dyn, self.btn_clear_chan
         ]
@@ -1336,6 +1583,8 @@ class OscilloscopeAnalyzer(QMainWindow):
         #from pathlib import Path
         #self.dataset_id = str(Path(folder).resolve())
         self.dataset_id = os.path.abspath(folder)
+        self.sg_cache_dir = os.path.join(self.dataset_id, ".palantir_sg")
+        self.channel_axis_limits.clear()
         self.folder_label.setText(f"Folder: {folder}")
         self.folder_label.setToolTip(folder)
 
@@ -1374,6 +1623,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self._all_event_keys = sorted(events.keys(), key=lambda x: int(re.search(r"(\d+)$", x).group(1)) if re.search(r"(\d+)$", x) else x)
         self.feature_filter_active = False
         self.feature_filter_keys = []
+        self.event_quality = {}
         self.event_combo.clear()
         self.event_combo.addItems(self._all_event_keys)
         self.set_controls_enabled(True)
@@ -1392,12 +1642,14 @@ class OscilloscopeAnalyzer(QMainWindow):
 
     def load_event(self, idx):
         evt = self.event_combo.currentText()
+        self._sync_quality_spin(evt)
         
         # Clear current display data but preserve fit results
         self.current_data.clear()
-        self.fit_regions.clear() 
+        self.fit_regions.clear()
         self.span_selectors.clear()
         self.sg_filtered.clear()
+        self.sg_filtered_meta.clear()
         self.meta_label.setText("MetaMatch result will appear here.")
         
         if not evt:
@@ -1423,10 +1675,34 @@ class OscilloscopeAnalyzer(QMainWindow):
 
         # Plot waveforms first
         self.plot_waveforms()
-        
+        # Restore and overlay any cached SG traces for this width
+        self._restore_cached_sg(evt)
+
         # Now recall and replot any existing fits for this event
         self.recall_fits_for_event(evt)
         self.fit_info_window.update_info(self.results, evt)
+
+    def _sync_quality_spin(self, evt):
+        if not hasattr(self, "quality_spin"):
+            return
+        self._quality_spin_guard = True
+        try:
+            value = int(self.event_quality.get(evt, 0) or 0)
+        except Exception:
+            value = 0
+        self.quality_spin.setValue(max(0, min(5, value)))
+        self._quality_spin_guard = False
+
+    def _on_quality_changed(self, value):
+        if self._quality_spin_guard:
+            return
+        evt = self.event_combo.currentText()
+        if not evt:
+            return
+        if value <= 0:
+            self.event_quality.pop(evt, None)
+        else:
+            self.event_quality[evt] = int(value)
 
     def recall_fits_for_event(self, evt):
         """Recall and replot all fits for the given event"""
@@ -1660,33 +1936,229 @@ class OscilloscopeAnalyzer(QMainWindow):
         add_shortcut(Qt.Key_Enter,  lambda: (self.btn_dyn.isEnabled() and self.run_dynamic_fit()))
         add_shortcut(Qt.Key_A,      lambda: (self.btn_adjust_dyn.isEnabled() and self.adjust_dynamic_params()))
 
-    def plot_waveforms(self):
-        self.figure.clf()
-        decim = self.decim_spin.value()
+    def _apply_saved_axis_limits(self, ax, ch):
+        """Restore persisted axis limits for a channel, if any."""
+        limits = self.channel_axis_limits.get(ch)
+        if not limits:
+            return
+        xlim = limits.get('xlim')
+        ylim = limits.get('ylim')
+        if xlim is not None:
+            ax.set_xlim(xlim)
+        if ylim is not None:
+            ax.set_ylim(ylim)
+
+    def reset_axis_limits(self, channel=None):
+        """Clear saved axis limits and return current plots to auto-scale."""
+        if isinstance(channel, bool):
+            channel = None  # clicked(bool) emits False for plain buttons; treat as global reset
+        if not self.current_data:
+            return
+        if channel is None:
+            self.channel_axis_limits.clear()
+        else:
+            self.channel_axis_limits.pop(channel, None)
+        self._refresh_current_event_plots()
+        self.canvas.draw_idle()
+
+    def _refresh_current_event_plots(self):
+        """Replot current event waveforms and overlays using stored data."""
+        evt = self.event_combo.currentText()
+        if not evt or not self.current_data:
+            return
+        self.plot_waveforms()
+        self._redraw_sg_overlays()
+        self.recall_fits_for_event(evt)
+        self.fit_info_window.update_info(self.results, evt)
+
+    def _connect_axis_event_hooks(self):
+        if not hasattr(self, "_axis_event_ids"):
+            self._axis_event_ids = []
+        callbacks = [
+            ('button_release_event', self._on_axis_mouse_release),
+            ('scroll_event', self._on_axis_scroll),
+        ]
+        for name, handler in callbacks:
+            try:
+                cid = self.canvas.mpl_connect(name, handler)
+            except Exception:
+                continue
+            self._axis_event_ids.append(cid)
+
+    def _on_axis_mouse_release(self, event):
+        if self._suspend_axis_capture:
+            return
+        ax = getattr(event, "inaxes", None)
+        if ax is None:
+            return
+        if getattr(event, "button", None) not in (1, 2, 3):
+            return
+        self._store_axis_limits_from_axes(ax)
+
+    def _on_axis_scroll(self, event):
+        if self._suspend_axis_capture:
+            return
+        ax = getattr(event, "inaxes", None)
+        if ax is None:
+            return
+        self._store_axis_limits_from_axes(ax)
+
+    def _store_axis_limits_from_axes(self, ax):
+        ch = self._axis_to_channel.get(ax)
+        if ch is None:
+            return
+        limits = self.channel_axis_limits.setdefault(ch, {'xlim': None, 'ylim': None})
+        limits['xlim'] = tuple(ax.get_xlim())
+        limits['ylim'] = tuple(ax.get_ylim())
+
+    def _plot_sg_curve(self, ch, t, y_sg, redraw=True):
+        """Overlay SG line for a channel, replacing any prior SG curve."""
+        if not self.current_data:
+            return
         sorted_chs = sorted(self.current_data.keys())
-        for idx, ch in enumerate(sorted_chs, start=1):
-            ax = self.figure.add_subplot(len(sorted_chs), 1, idx)
-            ax.set_facecolor(self.plot_bg_color)
-            t, y, meta = self.current_data[ch]
-            # apply decimation
-            t_plot = t[::decim]
-            y_plot = y[::decim]
-            ax.plot(t_plot, y_plot, color=RAW_TRACE_COLOR, linewidth=1.3, label=f"Raw CH{ch}", zorder=2)
-            ax.set_ylabel(f"CH{ch} [V]", color=self.fg_color)
-            if idx == len(sorted_chs):
-                ax.set_xlabel("Time [s]", color=self.fg_color)
-            ax.tick_params(colors=self.fg_color)
-            for spine in ax.spines.values():
-                spine.set_color(self.fg_color)
-            sel = SpanSelector(
-                ax,
-                lambda xmin, xmax, ch=ch: self.on_select(ch, xmin, xmax),
-                'horizontal', useblit=True,
-                props=dict(alpha=0.3, facecolor='orange')
-            )
-            self.span_selectors[ch] = sel
-        self.figure.tight_layout()
+        if ch not in sorted_chs:
+            return
+        idx = sorted_chs.index(ch)
+        if idx >= len(self.figure.axes):
+            return
+        ax = self.figure.axes[idx]
+        for ln in list(ax.get_lines()):
+            if ln.get_label() == 'SG Filter':
+                try:
+                    ln.remove()
+                except Exception:
+                    pass
+        ax.plot(t, y_sg, label="SG Filter", **SG_FILTER_STYLE)
+        ax.legend()
+        if redraw:
+            self.canvas.draw()
+
+    def _redraw_sg_overlays(self):
+        """Re-plot stored SG overlays for the current event."""
+        if not self.sg_filtered:
+            return
+        for ch, data in self.sg_filtered.items():
+            if not isinstance(data, tuple) or len(data) != 2:
+                continue
+            t, y = data
+            self._plot_sg_curve(ch, t, y, redraw=False)
         self.canvas.draw()
+
+    def _sg_cache_dir_path(self):
+        return getattr(self, "sg_cache_dir", None)
+
+    def _ensure_sg_cache_dir(self):
+        path = self._sg_cache_dir_path()
+        if not path:
+            return None
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception:
+            return None
+        return path
+
+    def _sg_cache_filepath(self, evt, ch, width):
+        base = self._sg_cache_dir_path()
+        if not base:
+            return None
+        safe_evt = re.sub(r'[^0-9A-Za-z_-]', '_', str(evt))
+        return os.path.join(base, f"{safe_evt}_ch{ch}_w{width}.npz")
+
+    def _sg_cache_exists(self, evt, ch, width):
+        path = self._sg_cache_filepath(evt, ch, width)
+        return bool(path and os.path.exists(path))
+
+    def _write_sg_cache(self, evt, ch, width, t, y):
+        if not evt:
+            return False
+        directory = self._ensure_sg_cache_dir()
+        if not directory:
+            return False
+        path = self._sg_cache_filepath(evt, ch, width)
+        if not path:
+            return False
+        try:
+            np.savez_compressed(
+                path,
+                t=np.asarray(t, dtype=np.float64),
+                y=np.asarray(y, dtype=np.float64),
+            )
+            return True
+        except Exception:
+            return False
+
+    def _load_sg_cache(self, evt, ch, width):
+        path = self._sg_cache_filepath(evt, ch, width)
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            data = np.load(path, allow_pickle=False)
+            return np.asarray(data["t"], dtype=np.float64), np.asarray(data["y"], dtype=np.float64)
+        except Exception:
+            return None
+
+    def _delete_sg_cache(self, evt, ch, width):
+        path = self._sg_cache_filepath(evt, ch, width)
+        if not path or not os.path.exists(path):
+            return
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+    def _restore_cached_sg(self, evt):
+        """Load cached SG data for the current SG width and overlay it."""
+        if not evt:
+            return False
+        width = int(self.sg_win.value())
+        loaded = False
+        for ch in sorted(self.current_data.keys()):
+            cached = self._load_sg_cache(evt, ch, width)
+            if cached is None:
+                continue
+            t, y = cached
+            self.sg_filtered[ch] = (t, y)
+            self.sg_filtered_meta[ch] = width
+            self._plot_sg_curve(ch, t, y, redraw=False)
+            loaded = True
+        if loaded:
+            self.canvas.draw()
+        return loaded
+
+    def plot_waveforms(self):
+        self._suspend_axis_capture = True
+        try:
+            self.figure.clf()
+            self._axis_to_channel = {}
+            decim = self.decim_spin.value()
+            sorted_chs = sorted(self.current_data.keys())
+            for idx, ch in enumerate(sorted_chs, start=1):
+                ax = self.figure.add_subplot(len(sorted_chs), 1, idx)
+                ax.set_facecolor(self.plot_bg_color)
+                t, y, meta = self.current_data[ch]
+                # apply decimation
+                t_plot = t[::decim]
+                y_plot = y[::decim]
+                ax.plot(t_plot, y_plot, color=RAW_TRACE_COLOR, linewidth=1.3, label=f"Raw CH{ch}", zorder=2)
+                ax.set_ylabel(f"CH{ch} [V]", color=self.fg_color)
+                if idx == len(sorted_chs):
+                    ax.set_xlabel("Time [s]", color=self.fg_color)
+                ax.tick_params(colors=self.fg_color)
+                for spine in ax.spines.values():
+                    spine.set_color(self.fg_color)
+                self._axis_to_channel[ax] = ch
+                self._apply_saved_axis_limits(ax, ch)
+                sel = SpanSelector(
+                    ax,
+                    lambda xmin, xmax, ch=ch: self.on_select(ch, xmin, xmax),
+                    'horizontal', useblit=True,
+                    props=dict(alpha=0.3, facecolor='orange')
+                )
+                self.span_selectors[ch] = sel
+            self.figure.tight_layout()
+            self.canvas.draw()
+        finally:
+            self._suspend_axis_capture = False
 
     def on_select(self, channel, xmin, xmax):
         self.fit_regions[channel] = (xmin, xmax)
@@ -1854,18 +2326,212 @@ class OscilloscopeAnalyzer(QMainWindow):
         ch = int(self.sg_ch.currentText()); data = self.current_data.get(ch)
         if data is None:
             QMessageBox.warning(self, "No Data", f"CH{ch} not loaded."); return
-        t, y, _ = data; w = self.sg_win.value()
-        if w>len(y): QMessageBox.warning(self, "Window Too Large", "SG window > data length."); return
-        y_sg = sig.savgol_filter(y, w, 2)
+        t, y, _ = data; w = int(self.sg_win.value())
+        if w < 5:
+            QMessageBox.warning(self, "Invalid Window", "SG window must be at least 5 samples.")
+            return
+        if w % 2 == 0:
+            QMessageBox.warning(self, "Invalid Window", "Savitzky–Golay window length must be odd.")
+            return
+        if w >= len(y):
+            QMessageBox.warning(self, "Window Too Large", "SG window must be smaller than the trace length.")
+            return
+        try:
+            y_sg = sig.savgol_filter(y, w, 2)
+        except Exception as e:
+            QMessageBox.warning(self, "SG Error", f"Failed to filter: {e}")
+            return
         self.sg_filtered[ch] = (t, y_sg)
-        ax = self.figure.axes[sorted(self.current_data).index(ch)]
-        for ln in list(ax.get_lines()):
-            if ln.get_label() == 'SG Filter':
-                ax.lines.remove(ln)
-        ax.plot(t, y_sg, label="SG Filter", **SG_FILTER_STYLE)
-        ax.legend()
-        self.canvas.draw()
+        self.sg_filtered_meta[ch] = w
+        self._plot_sg_curve(ch, t, y_sg)
+        evt = self.event_combo.currentText()
+        self._write_sg_cache(evt, ch, w, t, y_sg)
         # End run_sg_filter
+
+    def run_batch_sg_filter(self):
+        """Run SG filtering across a range of events and cache the results."""
+        if not getattr(self, "event_files", None):
+            QMessageBox.warning(self, "No Folder", "Select a folder with TRC files first.")
+            return
+        ch = int(self.sg_ch.currentText())
+        width = int(self.sg_win.value())
+        if width < 5:
+            QMessageBox.warning(self, "Invalid Window", "SG window must be at least 5 samples.")
+            return
+        if width % 2 == 0:
+            QMessageBox.warning(self, "Invalid Window", "Savitzky–Golay window length must be odd.")
+            return
+
+        ev_pairs = []
+        for i in range(self.event_combo.count()):
+            key = self.event_combo.itemText(i)
+            try:
+                iv = int(key)
+            except Exception:
+                m = re.search(r"(\d+)$", key)
+                if not m:
+                    continue
+                iv = int(m.group(1))
+            ev_pairs.append((iv, key))
+        if not ev_pairs:
+            QMessageBox.warning(self, "No Events", "No events available for batch filtering.")
+            return
+        ev_pairs.sort(key=lambda x: x[0])
+        evt_min = ev_pairs[0][0]
+        evt_max = ev_pairs[-1][0]
+
+        max_threads = max(1, os.cpu_count() or 1)
+        default_threads = getattr(self, "_sg_batch_thread_count", min(4, max_threads))
+        dlg = SGBatchDialog(self, evt_min, evt_max, default_threads=default_threads, max_threads=max_threads)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        try:
+            ev0, ev1, overwrite, thread_count = dlg.values()
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid Input", str(e))
+            return
+
+        thread_count = max(1, min(thread_count, max_threads))
+        self._sg_batch_thread_count = thread_count
+
+        targets = [key for (iv, key) in ev_pairs if ev0 <= iv <= ev1]
+        if not targets:
+            QMessageBox.information(self, "No Events", "No events in the specified range.")
+            return
+
+        if not self._ensure_sg_cache_dir():
+            QMessageBox.warning(self, "Cache Unavailable", "Unable to create SG cache directory in the selected folder.")
+            return
+
+        skipped_existing = skipped_missing = 0
+        job_list = []
+        for evt in targets:
+            if not overwrite and self._sg_cache_exists(evt, ch, width):
+                skipped_existing += 1
+                continue
+            ch_path = None
+            for path in self.event_files.get(evt, []):
+                if re.match(fr"C{ch}", os.path.basename(path) or ""):
+                    ch_path = path
+                    break
+            if not ch_path:
+                skipped_missing += 1
+                continue
+            job_list.append((evt, ch_path))
+
+        if not job_list:
+            summary = [
+                f"No events required SG filtering for CH{ch} (width {width}).",
+            ]
+            if skipped_existing:
+                summary.append(f"Skipped existing cache: {skipped_existing}")
+            if skipped_missing:
+                summary.append(f"No channel file: {skipped_missing}")
+            QMessageBox.information(self, "Batch SG Filter", "\n".join(summary))
+            return
+
+        prog = QProgressDialog("Batch SG filtering...", "Cancel", 0, len(job_list), self)
+        prog.setWindowModality(Qt.ApplicationModal)
+        prog.setAutoClose(True)
+        prog.show()
+
+        processed = skipped_short = 0
+        errors = []
+        current_evt = self.event_combo.currentText()
+        current_payload = None
+        cancel_event = threading.Event()
+
+        def _batch_worker(evt, ch_path):
+            if cancel_event.is_set():
+                return {"status": "cancelled", "event": evt}
+            try:
+                t, y, _ = self.trc.open(ch_path)
+            except Exception as e:
+                return {"status": "error", "event": evt, "error": e}
+            y = np.asarray(y, dtype=np.float64)
+            if width >= len(y):
+                return {"status": "too_short", "event": evt}
+            try:
+                y_sg = sig.savgol_filter(y, width, 2)
+            except Exception as e:
+                return {"status": "error", "event": evt, "error": e}
+            self._write_sg_cache(evt, ch, width, t, y_sg)
+            payload = {"status": "ok", "event": evt}
+            if evt == current_evt:
+                payload["t"] = t
+                payload["y"] = y_sg
+            return payload
+
+        executor = ThreadPoolExecutor(max_workers=thread_count)
+        futures = {
+            executor.submit(_batch_worker, evt, path): evt
+            for evt, path in job_list
+        }
+
+        try:
+            completed = 0
+            for future in as_completed(futures):
+                evt = futures[future]
+                if prog.wasCanceled():
+                    cancel_event.set()
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {"status": "error", "event": evt, "error": exc}
+
+                completed += 1
+                prog.setValue(completed)
+                prog.setLabelText(f"Filtering CH{ch} on event {evt} ({completed}/{len(job_list)})")
+                QApplication.processEvents()
+
+                status = result.get("status")
+                if status == "ok":
+                    processed += 1
+                    if "t" in result and result["t"] is not None and ch in self.current_data:
+                        current_payload = (result["t"], result["y"])
+                elif status == "too_short":
+                    skipped_short += 1
+                elif status == "error":
+                    err = result.get("error")
+                    errors.append(f"{evt}: {err}" if err is not None else f"{evt}: Unknown error")
+
+                if cancel_event.is_set():
+                    break
+        finally:
+            cancel_event.set()
+            for fut in futures:
+                fut.cancel()
+            executor.shutdown(wait=False)
+
+        prog.setValue(len(job_list))
+        prog.close()
+
+        if current_payload:
+            self.sg_filtered[ch] = current_payload
+            self.sg_filtered_meta[ch] = width
+            self._plot_sg_curve(ch, *current_payload)
+
+        summary = [
+            f"SG batch complete for CH{ch} (width {width}).",
+            f"Processed: {processed}",
+            f"Threads used: {thread_count}",
+        ]
+        if skipped_existing:
+            summary.append(f"Skipped existing cache: {skipped_existing}")
+        if skipped_missing:
+            summary.append(f"No channel file: {skipped_missing}")
+        if skipped_short:
+            summary.append(f"Trace too short: {skipped_short}")
+        if prog.wasCanceled():
+            summary.append("Cancelled by user.")
+
+        QMessageBox.information(self, "Batch SG Filter", "\n".join(summary))
+
+        if errors:
+            preview = "\n".join(errors[:5])
+            if len(errors) > 5:
+                preview += f"\n... ({len(errors) - 5} more)"
+            QMessageBox.warning(self, "Batch Errors", f"Some events could not be processed:\n{preview}")
 
     def _guess_params(self, func_name, names, t_sel, y_sel):
         """Return initial parameter guesses and bounds for curve_fit."""
@@ -2069,20 +2735,39 @@ class OscilloscopeAnalyzer(QMainWindow):
             if w % 2 == 0:
                 w -= 1
             w = max(5, w)
-            # Prepare data (apply invert for picking minima)
+            # Prepare data (apply invert for picking minima) and remove baseline trend.
             y_proc = -y_base_fit if invert_flag else y_base_fit
+            # Fit a first-order baseline using the leading 20% of the window to avoid pulse bias.
+            baseline_slope = 0.0
+            lead_count = max(2, int(np.ceil(0.2 * len(t_fit))))
+            t_base = t_fit[:lead_count]
+            y_base = y_base_fit[:lead_count]
+            baseline_intercept = float(np.mean(y_base)) if y_base.size else (float(np.mean(y_base_fit)) if y_base_fit.size else 0.0)
+            if t_base.size >= 2:
+                try:
+                    coeffs = np.polyfit(t_base, y_base, 1)
+                    baseline_slope = float(coeffs[0])
+                    baseline_intercept = float(coeffs[1])
+                except Exception:
+                    baseline_slope = 0.0
+                    baseline_intercept = float(np.mean(y_base)) if y_base.size else (float(np.mean(y_base_fit)) if y_base_fit.size else 0.0)
+            baseline_vals = baseline_slope * t_fit + baseline_intercept
+            baseline_proc = -baseline_vals if invert_flag else baseline_vals
+            y_corr = y_proc - baseline_proc
             try:
-                y_f = sig.savgol_filter(y_proc, w, 2)
+                y_f = sig.savgol_filter(y_corr, w, 2)
             except Exception as e:
                 QMessageBox.warning(self, "SG Error", f"Failed to filter: {e}")
                 return
             idx = int(np.argmax(y_f)) if y_f.size else 0
             t_peak = float(t_fit[idx]) if len(t_fit) else None
-            val_proc = float(y_f[idx]) if y_f.size else None
-            if t_peak is None or val_proc is None:
+            val_corr_proc = float(y_f[idx]) if y_f.size else None
+            if t_peak is None or val_corr_proc is None:
                 QMessageBox.warning(self, "No Data", "Selection too small for SG filter.")
                 return
-            val = -val_proc if invert_flag else val_proc
+            val_corr = -val_corr_proc if invert_flag else val_corr_proc
+            baseline_peak = float(baseline_slope * t_fit[idx] + baseline_intercept)
+            value_raw = baseline_peak + val_corr
             # Plot marker on original polarity
             ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
             # Remove prior marker if any for this selection
@@ -2096,7 +2781,7 @@ class OscilloscopeAnalyzer(QMainWindow):
                 key = f"{base}_{idx_num}"
             label = f"{func_name} {idx_num}" if idx_num > 1 else f"{func_name}"
             color = self._resolve_fit_color(func_name)
-            line, = ax.plot([t_peak], [val], marker='o', linestyle='None',
+            line, = ax.plot([t_peak], [value_raw], marker='o', linestyle='None',
                              color=color, markeredgecolor=color, markerfacecolor=color,
                              markersize=6, label=label, zorder=4)
             line.set_gid(key)
@@ -2106,12 +2791,14 @@ class OscilloscopeAnalyzer(QMainWindow):
             ax.legend(); self.canvas.draw()
             # Store record
             self.results[key] = {
-                "params": (int(w),),
-                "param_names": ["width"],
+                "params": (int(w), float(baseline_slope), float(baseline_intercept)),
+                "param_names": ["width", "baseline_slope", "baseline_intercept"],
                 "fit_region": region if region is not None else (float(t_sel[0]), float(t_sel[-1])),
                 "dataset_id": self.dataset_id,
                 "inverted": invert_flag,
-                "value": float(val),
+                "value": float(val_corr),
+                "value_raw": float(value_raw),
+                "baseline": float(baseline_peak),
                 "t_at": float(t_peak),
                 "line": line,
             }
@@ -2134,8 +2821,8 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.fit_worker = FitWorker(func, t_fit, y_fit, p0, bounds)
         current_evt = self.event_combo.currentText()
         self.fit_worker.result.connect(
-            lambda popt, err, fn=func_name, nm=names, ch_=ch, reg=region, tt=t_sel, yy=y_sel, ev=current_evt:
-                self._finish_dynamic_fit(popt, err, fn, nm, ch_, reg, tt, yy, ev))
+            lambda payload, err, fn=func_name, nm=names, ch_=ch, reg=region, tt=t_sel, yy=y_sel, ev=current_evt:
+                self._finish_dynamic_fit(payload, err, fn, nm, ch_, reg, tt, yy, ev))
         self.fit_worker.start()
 
     def _show_fft(self, t_sel, y_sel, ch, evt):
@@ -2593,11 +3280,12 @@ class OscilloscopeAnalyzer(QMainWindow):
                 upper_arr = np.asarray(upper, dtype=np.float64)
                 has_bounds = bool(np.isfinite(lower_arr).any() or np.isfinite(upper_arr).any())
                 if has_bounds:
-                    popt, _ = curve_fit(func, t_fit, y_fit, p0=p0, bounds=(lower_arr, upper_arr), maxfev=20000)
+                    popt, pcov = curve_fit(func, t_fit, y_fit, p0=p0, bounds=(lower_arr, upper_arr), maxfev=20000)
                 else:
-                    popt, _ = curve_fit(func, t_fit, y_fit, p0=p0, maxfev=20000)
+                    popt, pcov = curve_fit(func, t_fit, y_fit, p0=p0, maxfev=20000)
             except Exception as err:
                 return {"status": "error", "event": evt_key, "error": err}
+            errors = self._covariance_to_errors(pcov, len(popt))
 
             payload = {
                 "status": "ok",
@@ -2605,6 +3293,8 @@ class OscilloscopeAnalyzer(QMainWindow):
                 "event": evt_key,
                 "params": tuple(float(v) for v in popt),
             }
+            if errors is not None:
+                payload["errors"] = tuple(float(e) if np.isfinite(e) else np.nan for e in errors)
             if can_plot_current and evt_key == current_event:
                 payload["plot_t"] = t_sel_full
             return payload
@@ -2683,6 +3373,8 @@ class OscilloscopeAnalyzer(QMainWindow):
                 else:
                     params = result["params"]
                     rec.update({"params": params, "param_names": names})
+                    if "errors" in result and result["errors"] is not None:
+                        rec["param_errors"] = tuple(result["errors"])
                     if func_name == "QD3Fit":
                         try:
                             charge, mass, rad = QD3Cal(params[1], params[2])
@@ -2742,7 +3434,32 @@ class OscilloscopeAnalyzer(QMainWindow):
         if hasattr(self, "fit_worker") and self.fit_worker is not None:
             self.fit_worker.cancelled = True
 
-    def _finish_dynamic_fit(self, popt, err, func_name, names, ch, region, t_sel, y_sel, evt):
+    @staticmethod
+    def _covariance_to_errors(pcov, count):
+        if pcov is None or count <= 0:
+            return None
+        try:
+            diag = np.diag(pcov)
+        except Exception:
+            return None
+        if diag is None or diag.size == 0:
+            return None
+        errors = []
+        use_count = min(count, diag.size)
+        for i in range(use_count):
+            val = diag[i]
+            if not np.isfinite(val) or val < 0:
+                errors.append(np.nan)
+            else:
+                errors.append(float(np.sqrt(val)))
+        # Pad with NaN if diag shorter than expected parameter count
+        while len(errors) < count:
+            errors.append(np.nan)
+        if not any(np.isfinite(err) for err in errors):
+            return None
+        return tuple(errors)
+
+    def _finish_dynamic_fit(self, fit_payload, err, func_name, names, ch, region, t_sel, y_sel, evt):
         self.fit_progress.close()
         self.fit_worker = None
         if err is not None:
@@ -2750,6 +3467,19 @@ class OscilloscopeAnalyzer(QMainWindow):
                 QMessageBox.information(self, "Fit Cancelled", "Fit was cancelled.")
             else:
                 QMessageBox.warning(self, "Fit Failed", str(err))
+            return
+
+        if fit_payload is None:
+            QMessageBox.warning(self, "Fit Failed", "No fit results were returned.")
+            return
+
+        if isinstance(fit_payload, tuple) and len(fit_payload) == 2:
+            popt, pcov = fit_payload
+        else:
+            popt, pcov = fit_payload, None
+
+        if popt is None:
+            QMessageBox.warning(self, "Fit Failed", "Fit did not return parameter values.")
             return
 
         base = f"evt_{evt}_{func_name}_ch{ch}"
@@ -2763,6 +3493,8 @@ class OscilloscopeAnalyzer(QMainWindow):
         if region is None:
             region = (t_sel[0], t_sel[-1])
 
+        param_errors = self._covariance_to_errors(pcov, len(popt))
+
         self.results[key] = {
             "params": tuple(popt),
             "param_names": names,
@@ -2770,6 +3502,8 @@ class OscilloscopeAnalyzer(QMainWindow):
             "dataset_id": self.dataset_id,
             "inverted": self.dyn_invert.isChecked(),
         }
+        if param_errors is not None:
+            self.results[key]["param_errors"] = param_errors
 
         if func_name == "QD3Fit":
             charge, mass, rad = QD3Cal(popt[1], popt[2])
@@ -2822,66 +3556,304 @@ class OscilloscopeAnalyzer(QMainWindow):
         if key is None:
             return
         rec = self.results[key]
-        # Special-case: low_pass_max width adjustment
+        # Special-case: low_pass_max parameter adjustment
         if func_name == "low_pass_max":
-            try:
-                cur_w = int(rec.get("params", (self.sg_win.value() if hasattr(self, 'sg_win') else 201,))[0])
-            except Exception:
-                cur_w = 201
-            # Build simple dialog with QSpinBox for width
+            params = tuple(rec.get("params", ()))
+            names = list(rec.get("param_names", ()))
+            param_map = {n: params[i] for i, n in enumerate(names) if i < len(params)}
+
+            def _get_param(name, default):
+                try:
+                    return float(param_map[name])
+                except Exception:
+                    return float(default)
+
+            default_w = None
+            if "width" in param_map:
+                default_w = _get_param("width", 201)
+            elif params:
+                try:
+                    default_w = float(params[0])
+                except Exception:
+                    default_w = None
+            if default_w is None:
+                try:
+                    default_w = float(self.sg_win.value())
+                except Exception:
+                    default_w = 201.0
+
+            invert_flag = bool(rec.get("inverted", False))
+            region = self.fit_regions.get(ch) or rec.get("fit_region")
+            if ch not in self.current_data:
+                QMessageBox.warning(self, "Missing Data", "Channel data is unavailable.")
+                return
+            t_full, y_full, _ = self.current_data[ch]
+            if region is not None:
+                mask = (t_full >= region[0]) & (t_full <= region[1])
+            else:
+                mask = np.ones_like(t_full, dtype=bool)
+            t_sel = np.asarray(t_full[mask], dtype=np.float64)
+            y_sel = np.asarray(y_full[mask], dtype=np.float64)
+            if t_sel.size == 0 or y_sel.size == 0:
+                QMessageBox.warning(self, "No Data", "Selection is empty; adjust the fit window.")
+                return
+            if region is None:
+                region = (float(t_sel[0]), float(t_sel[-1]))
+
+            cur_slope = param_map.get("baseline_slope", None)
+            cur_intercept = param_map.get("baseline_intercept", None)
+            lead_count = max(2, int(np.ceil(0.2 * len(t_sel)))) if len(t_sel) else 0
+            t_base = t_sel[:lead_count]
+            y_base = y_sel[:lead_count]
+            if cur_slope is None or cur_intercept is None:
+                if lead_count >= 2:
+                    try:
+                        coeffs = np.polyfit(t_base, y_base, 1)
+                        cur_slope = float(coeffs[0])
+                        cur_intercept = float(coeffs[1])
+                    except Exception:
+                        cur_slope = 0.0
+                        cur_intercept = float(np.mean(y_base)) if y_base.size else (float(np.mean(y_sel)) if y_sel.size else 0.0)
+                else:
+                    cur_slope = 0.0
+                    cur_intercept = float(np.mean(y_base)) if y_base.size else (float(np.mean(y_sel)) if y_sel.size else 0.0)
+
             dlg = QDialog(self)
             dlg.setWindowTitle("Low-pass Max Settings")
             lay = QVBoxLayout(dlg)
-            row = QHBoxLayout(); lay.addLayout(row)
-            row.addWidget(QLabel("SG window (samples, odd):"))
-            sp = QSpinBox(); sp.setRange(5, 9999); sp.setSingleStep(2)
-            # Ensure odd
-            if cur_w % 2 == 0: cur_w += 1
-            sp.setValue(cur_w)
-            row.addWidget(sp)
+
+            width_row = QHBoxLayout()
+            width_row.addWidget(QLabel("SG window (samples, odd):"))
+            width_spin = QSpinBox()
+            width_spin.setRange(5, 9999)
+            width_spin.setSingleStep(2)
+            cur_w = int(round(default_w))
+            if cur_w % 2 == 0:
+                cur_w += 1
+            width_spin.setValue(max(5, cur_w))
+            width_row.addWidget(width_spin)
+            lay.addLayout(width_row)
+
+            slope_row = QHBoxLayout()
+            slope_row.addWidget(QLabel("Baseline slope:"))
+            slope_spin = QDoubleSpinBox()
+            slope_spin.setDecimals(9)
+            slope_spin.setRange(-1e9, 1e9)
+            slope_spin.setValue(float(cur_slope))
+            slope_row.addWidget(slope_spin)
+            lay.addLayout(slope_row)
+
+            intercept_row = QHBoxLayout()
+            intercept_row.addWidget(QLabel("Baseline intercept:"))
+            intercept_spin = QDoubleSpinBox()
+            intercept_spin.setDecimals(9)
+            intercept_spin.setRange(-1e9, 1e9)
+            intercept_spin.setValue(float(cur_intercept))
+            intercept_row.addWidget(intercept_spin)
+            lay.addLayout(intercept_row)
+
+            auto_btn = QPushButton("Refit baseline")
+            auto_btn.setToolTip("Compute baseline slope/intercept from current selection.")
+            lay.addWidget(auto_btn)
+
+            # Derived parameter display
+            metrics_label = QLabel("Derived values (read-only):")
+            metrics_label.setStyleSheet("font-weight: bold; margin-top:6px;")
+            lay.addWidget(metrics_label)
+            metrics_form = QFormLayout()
+            t_at_field = QLineEdit(); t_at_field.setReadOnly(True)
+            baseline_field = QLineEdit(); baseline_field.setReadOnly(True)
+            value_field = QLineEdit(); value_field.setReadOnly(True)
+            raw_field = QLineEdit(); raw_field.setReadOnly(True)
+            eff_width_field = QLineEdit(); eff_width_field.setReadOnly(True)
+            metrics_form.addRow("t_at (s):", t_at_field)
+            metrics_form.addRow("baseline @ t_at:", baseline_field)
+            metrics_form.addRow("value (filtered):", value_field)
+            metrics_form.addRow("value_raw:", raw_field)
+            metrics_form.addRow("effective width:", eff_width_field)
+            lay.addLayout(metrics_form)
+
+            status_label = QLabel("")
+            status_label.setStyleSheet("color:#d32f2f;")
+            lay.addWidget(status_label)
+
+            # Preview plot
+            fig = Figure(figsize=(4.0, 2.6))
+            canvas = FigureCanvas(fig)
+            lay.addWidget(canvas)
+            ax_prev = fig.add_subplot(111)
+            fig.tight_layout()
+
+            def _auto_baseline():
+                lead_n = max(2, int(np.ceil(0.2 * len(t_sel))))
+                if lead_n < 2:
+                    status_label.setText("Need a larger selection to refit baseline.")
+                    return
+                try:
+                    coeffs = np.polyfit(t_sel[:lead_n], y_sel[:lead_n], 1)
+                    slope_spin.setValue(float(coeffs[0]))
+                    intercept_spin.setValue(float(coeffs[1]))
+                    status_label.setText("")
+                except Exception as err:
+                    status_label.setText(f"Baseline refit failed: {err}")
+
             btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dlg)
             lay.addWidget(btns)
-            btns.accepted.connect(dlg.accept); btns.rejected.connect(dlg.reject)
+            btns.accepted.connect(dlg.accept)
+            btns.rejected.connect(dlg.reject)
+
+            preview_state = {"ok": False, "data": None}
+
+            def _fmt(val):
+                try:
+                    return f"{float(val):.6g}"
+                except Exception:
+                    return str(val)
+
+            def _update_metrics(data):
+                if not data:
+                    for fld in (t_at_field, baseline_field, value_field, raw_field, eff_width_field):
+                        fld.setText("")
+                    return
+                t_at_field.setText(_fmt(data["t_at"]))
+                baseline_field.setText(_fmt(data["baseline"]))
+                value_field.setText(_fmt(data["value"]))
+                raw_field.setText(_fmt(data["value_raw"]))
+                eff_width_field.setText(str(int(data["width_eff"])))
+
+            def _recompute_preview(adjust_spinner=True):
+                if t_sel.size < 5:
+                    status_label.setText("Selection too small for SG filtering.")
+                    preview_state["ok"] = False
+                    return False
+                w_req = int(round(width_spin.value()))
+                if w_req % 2 == 0:
+                    w_req += 1
+                w_req = max(5, w_req)
+                max_w = max(5, t_sel.size - 1)
+                if max_w % 2 == 0:
+                    max_w -= 1
+                if w_req > max_w:
+                    w_req = max_w
+                    if adjust_spinner:
+                        width_spin.blockSignals(True)
+                        width_spin.setValue(w_req)
+                        width_spin.blockSignals(False)
+                slope_val = float(slope_spin.value())
+                intercept_val = float(intercept_spin.value())
+                y_proc = -y_sel if invert_flag else y_sel
+                baseline_vals = slope_val * t_sel + intercept_val
+                baseline_proc = -baseline_vals if invert_flag else baseline_vals
+                try:
+                    y_f = sig.savgol_filter(y_proc - baseline_proc, int(w_req), 2)
+                except Exception as e:
+                    status_label.setText(f"Failed to filter: {e}")
+                    preview_state["ok"] = False
+                    return False
+                if not y_f.size:
+                    status_label.setText("Filtered data is empty.")
+                    preview_state["ok"] = False
+                    return False
+                idx = int(np.argmax(y_f))
+                try:
+                    t_peak = float(t_sel[idx])
+                except Exception:
+                    status_label.setText("Unable to locate peak within selection.")
+                    preview_state["ok"] = False
+                    return False
+                val_corr_proc = float(y_f[idx])
+                val_corr = -val_corr_proc if invert_flag else val_corr_proc
+                baseline_peak = float(slope_val * t_sel[idx] + intercept_val)
+                value_raw = baseline_peak + val_corr
+                filtered_world = baseline_vals + (-y_f if invert_flag else y_f)
+
+                ax_prev.cla()
+                ax_prev.plot(t_sel, y_sel, label="Raw", color="#1976d2", linewidth=1.0)
+                ax_prev.plot(t_sel, baseline_vals, label="Baseline", color="#ef6c00", linestyle="--", linewidth=1.0)
+                ax_prev.plot(t_sel, filtered_world, label="Filtered", color="#2e7d32", linewidth=1.0)
+                ax_prev.axvline(t_peak, color="#d81b60", linestyle=":", linewidth=1.0)
+                ax_prev.plot([t_peak], [value_raw], marker='o', color="#d81b60", markersize=6, label="Peak")
+                ax_prev.set_xlabel("Time (s)")
+                ax_prev.set_ylabel("Voltage (V)")
+                ax_prev.grid(True, alpha=0.3)
+                ax_prev.legend(loc="best", fontsize="x-small")
+                fig.tight_layout()
+                canvas.draw_idle()
+
+                status_label.setText("")
+                data = {
+                    "width_eff": int(w_req),
+                    "slope": float(slope_val),
+                    "intercept": float(intercept_val),
+                    "t_at": float(t_peak),
+                    "value": float(val_corr),
+                    "value_raw": float(value_raw),
+                    "baseline": float(baseline_peak),
+                }
+                preview_state["ok"] = True
+                preview_state["data"] = data
+                _update_metrics(data)
+                return True
+
+            _recompute_preview(adjust_spinner=False)
+
+            width_spin.valueChanged.connect(lambda _: _recompute_preview())
+            slope_spin.valueChanged.connect(lambda _: _recompute_preview(adjust_spinner=False))
+            intercept_spin.valueChanged.connect(lambda _: _recompute_preview(adjust_spinner=False))
+            auto_btn.clicked.connect(lambda: (_auto_baseline(), _recompute_preview(adjust_spinner=False)))
+
             if dlg.exec_() != QDialog.Accepted:
                 return
-            w = int(sp.value())
-            if w % 2 == 0:
-                w += 1
-            # Recompute marker
-            t, y, _ = self.current_data[ch]
-            region = self.fit_regions.get(ch) or rec.get("fit_region")
-            mask = (t >= region[0]) & (t <= region[1])
-            t_sel, y_sel = t[mask], y[mask]
-            invert_flag = rec.get("inverted", False)
-            y_proc = -y_sel if invert_flag else y_sel
-            try:
-                y_f = sig.savgol_filter(y_proc, w, 2)
-                i = int(np.argmax(y_f)) if y_f.size else 0
-                t_peak = float(t_sel[i]) if len(t_sel) else None
-                val_proc = float(y_f[i]) if y_f.size else None
-                if t_peak is None or val_proc is None:
+
+            if not preview_state["ok"]:
+                if not _recompute_preview():
+                    QMessageBox.warning(self, "SG Error", status_label.text() or "Failed to update low_pass_max.")
                     return
-                val = -val_proc if invert_flag else val_proc
-            except Exception as e:
-                QMessageBox.warning(self, "SG Error", str(e)); return
+
+            data = preview_state["data"]
+            w = int(data["width_eff"])
+            slope_val = float(data["slope"])
+            intercept_val = float(data["intercept"])
+            t_peak = float(data["t_at"])
+            val_corr = float(data["value"])
+            value_raw = float(data["value_raw"])
+            baseline_peak = float(data["baseline"])
+
             ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
             line = rec.get("line")
-            if line in ax.lines:
-                line.remove()
             color = self._resolve_fit_color(func_name)
-            new_line, = ax.plot([t_peak], [val], marker='o', linestyle='None',
-                                 color=color, markeredgecolor=color, markerfacecolor=color,
-                                 markersize=6, label=f"low_pass_max", zorder=4)
-            new_line.set_gid(key)
+            if line in ax.lines:
+                line.set_marker('o')
+                line.set_linestyle('None')
+                line.set_color(color)
+                line.set_markerfacecolor(color)
+                line.set_markeredgecolor(color)
+                line.set_data([t_peak], [value_raw])
+                new_line = line
+            else:
+                idx_match = re.search(r"_(\d+)$", key)
+                suffix = idx_match.group(1) if idx_match else ""
+                label = f"{func_name} {suffix}".strip()
+                new_line, = ax.plot([t_peak], [value_raw], marker='o', linestyle='None',
+                                     color=color, markeredgecolor=color, markerfacecolor=color,
+                                     markersize=6, label=label, zorder=4)
+                new_line.set_gid(key)
             rec.update({
-                "params": (int(w),),
-                "param_names": ["width"],
-                "value": float(val),
+                "params": (int(w), float(slope_val), float(intercept_val)),
+                "param_names": ["width", "baseline_slope", "baseline_intercept"],
+                "value": float(val_corr),
+                "value_raw": float(value_raw),
+                "baseline": float(baseline_peak),
                 "t_at": float(t_peak),
                 "line": new_line,
                 "fit_region": region,
+                "dataset_id": rec.get("dataset_id", self.dataset_id),
+                "inverted": invert_flag,
             })
-            ax.legend(); self.canvas.draw(); self.fit_info_window.update_info(self.results, evt)
+            rec.pop("param_errors", None)
+            ax.legend()
+            self.canvas.draw()
+            self.fit_info_window.update_info(self.results, evt)
             return
         names = rec["param_names"]
         params = rec["params"]
@@ -2936,6 +3908,15 @@ class OscilloscopeAnalyzer(QMainWindow):
             rec["inverted"] = invert_flag
             rec["fit_region"] = region
             rec["line"] = line
+            cov_matrix = dlg.getCovariance()
+            if cov_matrix is not None:
+                errors = self._covariance_to_errors(cov_matrix, len(names))
+                if errors is not None:
+                    rec["param_errors"] = errors
+                else:
+                    rec.pop("param_errors", None)
+            else:
+                rec.pop("param_errors", None)
             if func_name == "QD3Fit":
                 charge, mass, rad = QD3Cal(params_dict["q"], params_dict["v"])
                 rec.update({"charge": charge, "mass": mass, "radius": rad})
@@ -3015,6 +3996,8 @@ class OscilloscopeAnalyzer(QMainWindow):
         # Special handling for low_pass_max
         if func_name == "low_pass_max":
             w = int(params[0]) if params else 201
+            baseline_slope = float(params[1]) if len(params) > 1 else 0.0
+            baseline_intercept = float(params[2]) if len(params) > 2 else 0.0
             # Ensure odd and valid
             w = max(5, w)
             if w % 2 == 0:
@@ -3022,16 +4005,34 @@ class OscilloscopeAnalyzer(QMainWindow):
             w = min(w, max(5, len(y_sel) - 1))
             if w % 2 == 0:
                 w -= 1
-            y_proc = -y_sel if inverted else y_sel
-            try:
-                y_f = sig.savgol_filter(y_proc, w, 2)
+            t_peak = rec.get("t_at")
+            value_raw = rec.get("value_raw")
+            val_corr = rec.get("value")
+            baseline_peak = rec.get("baseline")
+            need_recalc = (
+                t_peak is None or value_raw is None or val_corr is None or baseline_peak is None
+            )
+            if need_recalc and len(t_sel) and len(y_sel):
+                y_proc = -y_sel if inverted else y_sel
+                baseline_vals = baseline_slope * t_sel + baseline_intercept
+                baseline_proc = -baseline_vals if inverted else baseline_vals
+                try:
+                    y_f = sig.savgol_filter(y_proc - baseline_proc, w, 2)
+                except Exception:
+                    return
                 i = int(np.argmax(y_f)) if y_f.size else 0
                 t_peak = float(t_sel[i]) if len(t_sel) else None
-                val_proc = float(y_f[i]) if y_f.size else None
-                if t_peak is None or val_proc is None:
+                val_corr_proc = float(y_f[i]) if y_f.size else None
+                if t_peak is None or val_corr_proc is None:
                     return
-                val = -val_proc if inverted else val_proc
-            except Exception:
+                val_corr = -val_corr_proc if inverted else val_corr_proc
+                baseline_peak = float(baseline_slope * t_sel[i] + baseline_intercept)
+                value_raw = baseline_peak + val_corr
+                rec.setdefault("value", float(val_corr))
+                rec.setdefault("baseline", float(baseline_peak))
+                rec.setdefault("value_raw", float(value_raw))
+                rec.setdefault("t_at", float(t_peak))
+            if t_peak is None or value_raw is None:
                 return
             line = rec.get("line")
             if line in ax.lines:
@@ -3040,7 +4041,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             idxs = idx_match.group(1) if idx_match else ""
             label = f"{func_name} {idxs}".strip()
             color = self._resolve_fit_color(func_name)
-            new_line, = ax.plot([t_peak], [val], marker='o', linestyle='None',
+            new_line, = ax.plot([t_peak], [value_raw], marker='o', linestyle='None',
                                  color=color, markeredgecolor=color, markerfacecolor=color,
                                  markersize=6, label=label, zorder=4)
             new_line.set_gid(key)
@@ -3089,6 +4090,9 @@ class OscilloscopeAnalyzer(QMainWindow):
         try:
             with pd.HDFStore(path) as store:
                 store['fits'] = df
+                qdf = self._build_quality_dataframe()
+                if qdf is not None and not qdf.empty:
+                    store['quality'] = qdf
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to export fits:\n{e}")
             return
@@ -3106,6 +4110,18 @@ class OscilloscopeAnalyzer(QMainWindow):
         """Build a DataFrame from self.results in the same schema as export."""
         if not self.results:
             return pd.DataFrame()
+
+        def _append_param_errors(row_dict, param_names, record):
+            errors = record.get('param_errors')
+            if not errors or not param_names:
+                return
+            for name, err in zip(param_names, errors):
+                col = f"{name}_err"
+                try:
+                    row_dict[col] = float(err)
+                except Exception:
+                    continue
+
         records = []
         pattern = re.compile(r'^evt_(\d+)_(.+)_ch(\d+)(?:_\d+)?$')
         for key, rec in self.results.items():
@@ -3116,8 +4132,11 @@ class OscilloscopeAnalyzer(QMainWindow):
             ch = int(ch_str)
             row = {'event': event, 'channel': ch, 'fit_type': fit_type, 'dataset_id': rec.get('dataset_id')}
             params = rec.get('params', ())
+            param_names = list(rec.get('param_names', [f'p{i}' for i in range(len(params))]))
             ft = fit_type.lower()
             if ft.startswith('qd3'):
+                if not param_names:
+                    param_names = ["t0", "q", "v", "C"]
                 row.update({
                     't0': params[0] if len(params)>0 else None,
                     'q':  params[1] if len(params)>1 else None,
@@ -3129,6 +4148,8 @@ class OscilloscopeAnalyzer(QMainWindow):
                 })
                 row['impact_time'] = rec.get('impact_time', None)
             elif ft.startswith('qdm'):
+                if not param_names:
+                    param_names = ["t0", "q", "v", "C"]
                 row.update({
                     't0': params[0] if len(params)>0 else None,
                     'q':  params[1] if len(params)>1 else None,
@@ -3140,6 +4161,8 @@ class OscilloscopeAnalyzer(QMainWindow):
                 })
                 row['impact_time'] = rec.get('impact_time', None)
             elif ft.startswith('csa'):
+                if not param_names:
+                    param_names = ["t0", "C0", "C1", "C2", "T0", "T1", "T2", "C"]
                 row.update({
                     't0': params[0] if len(params)>0 else None,
                     'C0': params[1] if len(params)>1 else None,
@@ -3151,7 +4174,8 @@ class OscilloscopeAnalyzer(QMainWindow):
                     'C':  params[7] if len(params)>7 else None,
                 })
             else:
-                names = rec.get('param_names', [f'p{i}' for i in range(len(params))])
+                names = param_names or [f'p{i}' for i in range(len(params))]
+                param_names = list(names)
                 for n, v in zip(names, params):
                     row[n] = v
                 # Common optional fields for generic/special fits (e.g., low_pass_max)
@@ -3161,12 +4185,38 @@ class OscilloscopeAnalyzer(QMainWindow):
                     row['radius'] = rec['radius']
                 if 'value' in rec:
                     row['value'] = rec['value']
+                if 'value_raw' in rec:
+                    row['value_raw'] = rec['value_raw']
+                if 'baseline' in rec:
+                    row['baseline'] = rec['baseline']
                 if 't_at' in rec:
                     row['t_at'] = rec['t_at']
             # Persist inverted flag for round-trip accuracy
             row['inverted'] = bool(rec.get('inverted', False))
+            fit_region = rec.get('fit_region')
+            if isinstance(fit_region, (tuple, list)) and len(fit_region) == 2:
+                try:
+                    row['region_start'] = float(fit_region[0])
+                    row['region_end'] = float(fit_region[1])
+                except Exception:
+                    pass
+            _append_param_errors(row, param_names, rec)
             records.append(row)
         return pd.DataFrame.from_records(records)
+
+    def _build_quality_dataframe(self):
+        rows = []
+        for evt, rating in (self.event_quality or {}).items():
+            if rating is None:
+                continue
+            try:
+                r = int(rating)
+            except Exception:
+                continue
+            rows.append({'event': evt, 'quality': max(0, min(5, r))})
+        if not rows:
+            return pd.DataFrame(columns=['event', 'quality'])
+        return pd.DataFrame.from_records(rows)
 
     def open_results_plotter(self):
         """Open the Results Plotter window seeded with current in-memory fits."""
@@ -3244,6 +4294,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Load Fits", "", "HDF5 Files (*.h5 *.hdf5)")
         if not path:
             return
+        quality_df = None
         try:
             with pd.HDFStore(path) as store:
                 ks = set(store.keys())
@@ -3252,6 +4303,14 @@ class OscilloscopeAnalyzer(QMainWindow):
                     QMessageBox.warning(self, "Invalid File", "HDF5 file does not contain a 'fits' dataset.")
                     return
                 df = store[key]
+                qkey = '/quality' if '/quality' in ks else ('/event_quality' if '/event_quality' in ks else None)
+                if qkey is None:
+                    qkey = 'quality' if 'quality' in ks else ( 'event_quality' if 'event_quality' in ks else None)
+                if qkey:
+                    try:
+                        quality_df = store[qkey]
+                    except Exception:
+                        quality_df = None
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load fits:\n{e}")
             return
@@ -3285,6 +4344,46 @@ class OscilloscopeAnalyzer(QMainWindow):
                 return float(x) != 0.0
             except Exception:
                 return False
+
+        def _extract_region(row):
+            candidates = [
+                ('region_start', 'region_end'),
+                ('fit_region_start', 'fit_region_end'),
+                ('fit_region_min', 'fit_region_max'),
+                ('fit_tmin', 'fit_tmax'),
+            ]
+            for start_key, end_key in candidates:
+                if start_key in row and end_key in row and _is_num(row[start_key]) and _is_num(row[end_key]):
+                    a = float(row[start_key])
+                    b = float(row[end_key])
+                    return (a, b) if a <= b else (b, a)
+            if 'fit_region' in row:
+                region_val = row['fit_region']
+                if isinstance(region_val, (tuple, list)) and len(region_val) == 2:
+                    a, b = region_val
+                    if _is_num(a) and _is_num(b):
+                        a = float(a)
+                        b = float(b)
+                        return (a, b) if a <= b else (b, a)
+            return None
+
+        def _extract_param_errors(row, param_names):
+            if not param_names:
+                return None
+            errs = []
+            any_finite = False
+            for name in param_names:
+                col = f"{name}_err"
+                if col in df.columns:
+                    val = row.get(col)
+                    if _is_num(val):
+                        fval = float(val)
+                        errs.append(fval)
+                        if np.isfinite(fval):
+                            any_finite = True
+                        continue
+                errs.append(np.nan)
+            return tuple(errs) if any_finite else None
 
         base_keys = set(self.results.keys())
         added = 0
@@ -3342,8 +4441,17 @@ class OscilloscopeAnalyzer(QMainWindow):
 
             if names is None:
                 # Generic: collect numeric columns that are not meta
-                meta_cols = {'event','channel','fit_type','dataset_id','impact_time','charge','mass','radius'}
-                param_candidates = [c for c in df.columns if c not in meta_cols and _is_num(row.get(c))]
+                meta_cols = {
+                    'event','channel','fit_type','dataset_id','impact_time','charge','mass','radius',
+                    'region_start','region_end','fit_region_start','fit_region_end','fit_region_min','fit_region_max',
+                    'fit_tmin','fit_tmax','value','value_raw','baseline','t_at','inverted'
+                }
+                param_candidates = [
+                    c for c in df.columns
+                    if c not in meta_cols
+                    and not str(c).endswith('_err')
+                    and _is_num(row.get(c))
+                ]
                 # If pN style, sort by index; else preserve DataFrame order
                 def p_index(c):
                     m = re.match(r'^p(\d+)$', str(c))
@@ -3355,6 +4463,7 @@ class OscilloscopeAnalyzer(QMainWindow):
                 else:
                     names = list(param_candidates)
                 params = [float(row[n]) for n in names]
+            names = names or []
 
             # Dataset ID handling
             ds_val = None
@@ -3387,8 +4496,20 @@ class OscilloscopeAnalyzer(QMainWindow):
                 rec['radius'] = float(row['radius'])
             if 'value' in row and _is_num(row['value']):
                 rec['value'] = float(row['value'])
+            if 'value_raw' in row and _is_num(row['value_raw']):
+                rec['value_raw'] = float(row['value_raw'])
+            if 'baseline' in row and _is_num(row['baseline']):
+                rec['baseline'] = float(row['baseline'])
             if 't_at' in row and _is_num(row['t_at']):
                 rec['t_at'] = float(row['t_at'])
+            region = _extract_region(row)
+            if region is not None:
+                rec['fit_region'] = region
+
+            if names:
+                param_errors = _extract_param_errors(row, names)
+                if param_errors is not None:
+                    rec['param_errors'] = param_errors
 
             base = f"evt_{ev_str}_{fit_type}_ch{ch}"
             key = base
@@ -3405,6 +4526,22 @@ class OscilloscopeAnalyzer(QMainWindow):
             except Exception:
                 pass
 
+        if quality_df is not None and len(quality_df):
+            for _, row in quality_df.iterrows():
+                evt_raw = row.get('event')
+                rating = row.get('quality')
+                if evt_raw is None or not _is_num(rating):
+                    continue
+                evt_norm = _normalize_event_key(evt_raw)
+                try:
+                    rating_int = int(round(float(rating)))
+                except Exception:
+                    continue
+                rating_int = max(0, min(5, rating_int))
+                if evt_norm:
+                    self.event_quality[evt_norm] = rating_int
+            self._sync_quality_spin(self.event_combo.currentText())
+
         # If a current event is visible, redraw overlays from imported fits that match dataset
         evt = self.event_combo.currentText()
         if evt:
@@ -3419,15 +4556,27 @@ class OscilloscopeAnalyzer(QMainWindow):
         )
 
     def clear_sg_filter(self):
-        ch = self.sg_ch.currentText()
-        # SG is stored in self.sg_filtered, not self.results
-        self.sg_filtered.pop(int(ch), None)
-        for ax in self.figure.axes:
-            for line in list(ax.lines):
-                if line.get_label() == 'SG Filter':
-                    ax.lines.remove(line)
-            ax.legend()
+        if not self.current_data:
+            return
+        ch = int(self.sg_ch.currentText())
+        self.sg_filtered.pop(ch, None)
+        width = self.sg_filtered_meta.pop(ch, None)
+        sorted_chs = sorted(self.current_data.keys())
+        if ch in sorted_chs:
+            idx = sorted_chs.index(ch)
+            if idx < len(self.figure.axes):
+                ax = self.figure.axes[idx]
+                for line in list(ax.lines):
+                    if line.get_label() == 'SG Filter':
+                        try:
+                            line.remove()
+                        except Exception:
+                            pass
+                ax.legend()
         self.canvas.draw()
+        evt = self.event_combo.currentText()
+        if evt and width:
+            self._delete_sg_cache(evt, ch, width)
 
     def save_figure_transparent(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -3452,10 +4601,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         evt = self.event_combo.currentText()
         if not evt:
             return
-        # Redraw base waveforms with new decimation
-        self.plot_waveforms()
-        # Recall all existing fits for this event
-        self.recall_fits_for_event(evt)
+        self._refresh_current_event_plots()
 
     def clear_data(self):
         """Remove all stored fit results and clear plot annotations"""
@@ -3601,6 +4747,37 @@ class OscilloscopeAnalyzer(QMainWindow):
         if idx != -1:
             self.event_combo.setCurrentIndex(idx)
 
+    def run_quality_filter(self):
+        """Filter events to those with quality ≥ a chosen threshold."""
+        if not self._all_event_keys:
+            QMessageBox.information(self, "No Events", "No events are loaded.")
+            return
+        if not any((v or 0) > 0 for v in self.event_quality.values()):
+            QMessageBox.information(self, "No Ratings", "Assign quality ratings before filtering.")
+            return
+        default_min = max(1, min(5, self.quality_spin.value())) if hasattr(self, "quality_spin") else 3
+        min_q, ok = QInputDialog.getInt(
+            self,
+            "Quality Filter",
+            "Minimum quality (1–5)",
+            value=default_min or 3,
+            min=1,
+            max=5,
+        )
+        if not ok:
+            return
+        matches = [
+            evt for evt, rating in self.event_quality.items()
+            if evt in self._all_event_keys and (rating or 0) >= min_q
+        ]
+        if not matches:
+            QMessageBox.information(self, "No Matches", f"No events rated ≥ {min_q}.")
+            return
+        res_dlg = FeatureResultsDialog(self, matches)
+        res_dlg.exec_()
+        if res_dlg.action() == 'apply':
+            self.apply_event_filter(matches)
+
     def run_fit_filter(self):
         """Filter listed events by fit parameter criteria (e.g., QD3Fit v > 1e3)."""
         # Available fit types are the ones we know how to name
@@ -3729,10 +4906,12 @@ class OscilloscopeAnalyzer(QMainWindow):
             "• Select Folder (F), Event dropdown, Folder path label.\n"
             "• Navigation: Prev/Next (, .), Decim.  Session: Clear Event Fits (E), Save (Ctrl+S), Export (Ctrl+E), Load (Ctrl+I), Clear Data (Shift+D), Fit Info (U).\n"
             "• Metadata/Impact: Load Metadata (L), MetaMatch (M), D3Dist, Mark Impact (T).\n"
-            "• SG Row: SG Filter (S), Chan, Width, SG Batch (Ctrl+B), Clear SG (Shift+S) | Results Plotter (P), Feature Scan (Ctrl+F), Fit Filter (Ctrl+Shift+F), Clear Filter (Ctrl+K).\n"
+            "• SG Row: SG Filter (S), Chan, Width, SG Batch (Ctrl+B), Clear SG (Shift+S), Reset Axes | Results Plotter (P), Feature Scan (Ctrl+F), Fit Filter (Ctrl+Shift+F), Clear Filter (Ctrl+K).\n"
             "• Dynamic Row: Fit Func (QD3Fit/QDMFit/CSA/skew_gaussian/gaussian/FFT/low_pass_max), Chan (1–8), Invert (I), Run (Enter), Adjust (A), Clear (R), Clear Chan Fits (Shift+R), Batch (B), Use SG (Ctrl+Shift+S).\n\n"
             "Notes:\n"
             "• Fits run on raw data by default; QD3/QDM use SG only for initial parameter guessing.\n"
+            "• SG Batch runs multi-threaded and caches filtered traces (per channel + window) for rapid recall; clearing SG removes the cached trace for that channel/event.\n"
+            "• Reset Axes clears saved zoom/pan ranges so the next redraw returns to auto-scaling.\n"
             "• ‘Use SG’ applies SG-filtered data (if present) to Run Fit, Adjust Fit, and FFT.\n"
             "• FFT opens a popup spectrum with pan/zoom toolbar in log–log scale.\n"
             "• low_pass_max performs an SG low‑pass in the selection and reports the extremum.\n\n"

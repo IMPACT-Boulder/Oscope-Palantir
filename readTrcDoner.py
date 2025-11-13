@@ -1,3 +1,9 @@
+# Open Use License
+#
+# You may use, copy, modify, and redistribute this file for any purpose,
+# provided that redistributions include this original source code (including this notice).
+# This software is provided "as is" without warranty of any kind.
+
 """
 Little helper class to load data from a .trc binary file.
 This is the file format used by LeCroy oscilloscopes.

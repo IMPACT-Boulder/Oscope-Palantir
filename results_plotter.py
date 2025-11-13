@@ -1,3 +1,9 @@
+# Open Use License
+#
+# You may use, copy, modify, and redistribute this file for any purpose,
+# provided that redistributions include this original source code (including this notice).
+# This software is provided "as is" without warranty of any kind.
+
 import sys, os, re, traceback, inspect
 import numpy as np
 import pandas as pd
@@ -20,6 +26,13 @@ except Exception:
 # --- Try to load PVDF q(v) calibration CSVs if available ---
 _q_of_v_5 = None
 _q_of_v_9 = None
+_ELEMENTARY_CHARGE = 1.602176634e-19  # Coulombs per electron
+_E_PER_C = 1.0 / _ELEMENTARY_CHARGE   # electrons per Coulomb
+_CSA_LINEAR_CAL = {
+    "Cremat CSA 3um": (-8.23012166e-13, 2.30821114e-16),   # Q [C] = m*V + b
+    "Cremat CSA 8um": (1.02344806e-12, 5.45524781e-15),
+    "Cremat CSA 30um": (-8.29338526e-13, -1.24407122e-14),
+}
 try:
     from scipy.interpolate import interp1d
     if os.path.exists('q2v_5nf.csv'):
@@ -156,7 +169,8 @@ class FitResultsVisualizer(QMainWindow):
         row2.addWidget(self.ds_combo)
 
         row2.addWidget(QLabel("PVDF q(v) mode:"))
-        self.pvdf_combo = QComboBox(); self.pvdf_combo.addItems(['Off', '5nF segmented', '9.5nF monolithic'])
+        pvdf_modes = ['Off', '5nF segmented', '9.5nF monolithic'] + list(_CSA_LINEAR_CAL.keys())
+        self.pvdf_combo = QComboBox(); self.pvdf_combo.addItems(pvdf_modes)
         self.pvdf_combo.currentIndexChanged.connect(self.rebuild_groups)  # recalculates derived cols per group
         row2.addWidget(self.pvdf_combo)
         row2.addStretch()
@@ -402,26 +416,6 @@ class FitResultsVisualizer(QMainWindow):
             self.dprint(f"[_maybe_add_skew_peak] failed: {e}")
         return df
 
-    def _apply_qd_inversion_sign(self, df: pd.DataFrame) -> pd.DataFrame:
-        """For QD fits, flip q/charge sign when the fit was performed on inverted data."""
-        if df.empty or 'inverted' not in df.columns or 'q' not in df.columns:
-            return df
-        try:
-            mask = df['inverted'].fillna(0).astype(float) != 0.0
-        except Exception:
-            mask = df['inverted'].astype(bool)
-        if not mask.any():
-            return df
-        # Preserve the raw fit amplitude for reference/debugging.
-        if 'q_fit' not in df.columns:
-            df['q_fit'] = df['q'].copy()
-        df.loc[mask, 'q'] = -df.loc[mask, 'q'].abs()
-        if 'charge' in df.columns:
-            if 'charge_fit' not in df.columns:
-                df['charge_fit'] = df['charge'].copy()
-            df.loc[mask, 'charge'] = -df.loc[mask, 'charge'].abs()
-        return df
-
     def _apply_pvdf_q(self, df: pd.DataFrame) -> pd.DataFrame:
         """Apply PVDF q(v) calibration to an available peak/amplitude column.
 
@@ -431,8 +425,12 @@ class FitResultsVisualizer(QMainWindow):
           3) 'SG_peak' (legacy skew_gaussian peak above baseline by grid)
           4) 'value' (used by low_pass_max export)
 
-        Writes column 'pvdf_q' when calibration and data are available.
-        5nF segmented mode now applies calibration directly to the measured amplitude (no x10).
+        Writes:
+          • 'pvdf_q'  -> calibrated charge in electrons
+          • 'pvdf_q_c' -> same charge in Coulombs
+
+        Supports CSV-derived calibrations (5nF segmented, 9.5nF monolithic) and
+        linear Cremat CSA transfer functions (3um / 8um / 30um).
         """
         mode = self.pvdf_combo.currentText() if self.pvdf_combo is not None else 'Off'
         if mode == 'Off' or df.empty:
@@ -446,13 +444,33 @@ class FitResultsVisualizer(QMainWindow):
         if amp_col is None:
             return df
         try:
-            vals = pd.to_numeric(df[amp_col], errors='coerce').values
+            vals = pd.to_numeric(df[amp_col], errors='coerce').astype(float).values
+        except Exception:
+            return df
+
+        pvdf_q_e = None
+        pvdf_q_c = None
+        try:
             if mode.startswith('5nF') and _q_of_v_5 is not None:
-                df['pvdf_q'] = _q_of_v_5(vals)
-            elif _q_of_v_9 is not None:
-                df['pvdf_q'] = _q_of_v_9(vals)
+                pvdf_q_e = _q_of_v_5(vals)
+                pvdf_q_c = pvdf_q_e / _E_PER_C
+            elif mode.startswith('9.5nF') and _q_of_v_9 is not None:
+                pvdf_q_e = _q_of_v_9(vals)
+                pvdf_q_c = pvdf_q_e / _E_PER_C
+            elif mode in _CSA_LINEAR_CAL:
+                slope, intercept = _CSA_LINEAR_CAL[mode]
+                pvdf_q_c = slope * vals + intercept
+                pvdf_q_e = pvdf_q_c * _E_PER_C
         except Exception as e:
             self.dprint("[_apply_pvdf_q]", e)
+            pvdf_q_e = None
+            pvdf_q_c = None
+
+        if pvdf_q_e is not None:
+            df['pvdf_q'] = pvdf_q_e
+        if pvdf_q_c is not None:
+            df['pvdf_q_c'] = pvdf_q_c
+
         return df
 
     def _maybe_add_qd_cal(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -496,7 +514,6 @@ class FitResultsVisualizer(QMainWindow):
             if isinstance(ft, str) and _sanitize(ft) in ('skew_gaussian',):
                 g2 = self._maybe_add_skew_peak(g2)
             if isinstance(ft, str) and _sanitize(ft) in ('qd3fit','qdmfit'):
-                g2 = self._apply_qd_inversion_sign(g2)
                 g2 = self._maybe_add_qd_cal(g2)
             # Apply PVDF q(v) conversion to any available peak/amp field
             g2 = self._apply_pvdf_q(g2)
