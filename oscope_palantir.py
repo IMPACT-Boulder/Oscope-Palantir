@@ -2554,30 +2554,111 @@ class OscilloscopeAnalyzer(QMainWindow):
         upper = []
 
         if func_name in ("QD3Fit", "QD3Fit_soft"):
-            # heuristic similar to run_qd3_fit, but robust to short windows
-            try:
-                # choose an odd window <= len(y_sel)-1 and not too small
-                desired = 501
-                max_allowed = max(5, len(y_sel) - 1)
-                w = min(desired, max_allowed)
-                if w % 2 == 0:
-                    w = max(5, w - 1)
-                y_smooth = sig.savgol_filter(y_sel, w, 2)
-            except Exception:
-                y_smooth = y_sel
-            if len(y_smooth) >= 3:
+            dt = None
+            if len(t_sel) >= 2:
+                diffs = np.diff(t_sel)
+                diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+                if diffs.size:
+                    dt = float(np.median(diffs))
+            if dt is not None and np.isfinite(dt) and dt > 0:
+                target_durations = (1e-6, 10e-6, 20e-6)
+                windows = []
+                for duration in target_durations:
+                    samples = int(round(duration / dt))
+                    if samples < 3:
+                        samples = 3
+                    if samples % 2 == 0:
+                        samples += 1
+                    windows.append(samples)
+                windows = tuple(windows)
+            else:
+                windows = (101, 501, 10001)
+
+            def _qd3_attempt(desired_window):
+                if len(y_sel) < 3:
+                    return None
+                try:
+                    max_allowed = len(y_sel)
+                    if max_allowed % 2 == 0:
+                        max_allowed -= 1
+                    max_allowed = max(3, max_allowed)
+                    w = min(desired_window, max_allowed)
+                    if w % 2 == 0:
+                        w = max(3, w - 1)
+                    y_smooth = sig.savgol_filter(y_sel, w, 2)
+                except Exception:
+                    y_smooth = y_sel
+                if len(y_smooth) < 3:
+                    return None
                 y_min = float(np.min(y_smooth))
                 diff = np.diff(y_smooth)
                 if diff.size > 0:
                     rise = int(np.argmax(diff))
                     fall = int(np.argmin(diff))
                     dt = float(t_sel[rise] - t_sel[fall]) if 0 <= rise < len(t_sel) and 0 <= fall < len(t_sel) else 0.0
-                    det_vel = 0.19 / dt if dt != 0 else 1.0
+                    det_vel = abs(0.19 / dt) if dt != 0 else 1.0
                     t0_guess = float(t_sel[fall]) if 0 <= fall < len(t_sel) else float(t_sel[0])
                 else:
                     det_vel = 1.0
                     t0_guess = float(t_sel[0])
-                guess.update({"t0": t0_guess, "q": y_min, "v": det_vel})
+                attempt = {"t0": t0_guess, "q": y_min, "v": det_vel}
+                if "C" in names:
+                    attempt["C"] = float(np.mean(y_sel))
+                return attempt
+
+            def _qd3_chisq(attempt):
+                func = FIT_LIB.get(func_name, (None, None))[0]
+                if func is None:
+                    return None
+                params = [attempt.get(n) for n in names]
+                if any(p is None for p in params):
+                    return None
+                try:
+                    y_model = func(t_sel, *params)
+                except Exception:
+                    return None
+                resid = y_sel - y_model
+                resid = resid[np.isfinite(resid)]
+                if resid.size == 0:
+                    return None
+                return float(np.sum(resid * resid))
+
+            # De-duplicate while preserving order.
+            windows = tuple(dict.fromkeys(windows))
+            attempt_by_window = {}
+            max_workers = min(len(windows), max(1, getattr(self, "_sg_batch_thread_count", 1)))
+            if max_workers > 1:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {executor.submit(_qd3_attempt, w): w for w in windows}
+                    for future in as_completed(futures):
+                        w = futures[future]
+                        try:
+                            attempt_by_window[w] = future.result()
+                        except Exception:
+                            attempt_by_window[w] = None
+            else:
+                for w in windows:
+                    attempt_by_window[w] = _qd3_attempt(w)
+
+            best_guess = None
+            best_chi = None
+            fallback_guess = None
+            for w in windows:
+                attempt = attempt_by_window.get(w)
+                if attempt is None:
+                    continue
+                if fallback_guess is None:
+                    fallback_guess = attempt
+                chi = _qd3_chisq(attempt)
+                if chi is None:
+                    continue
+                if best_chi is None or chi < best_chi:
+                    best_chi = chi
+                    best_guess = attempt
+            if best_guess is None:
+                best_guess = fallback_guess
+            if best_guess:
+                guess.update(best_guess)
         elif func_name in ("QDMFit", "QDMobileFit"):
             try:
                 desired = 201
