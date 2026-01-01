@@ -22,7 +22,7 @@ from   scipy.optimize import curve_fit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PyQt5 import QtWidgets
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRegExp
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRegExp, QSettings
 from PyQt5.QtGui import QRegExpValidator, QKeySequence
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QDoubleSpinBox, QSpinBox,
@@ -988,6 +988,7 @@ class OscilloscopeAnalyzer(QMainWindow):
 
         self.setWindowTitle("Oscilloscope Waveform Analyzer")
         self.setGeometry(100, 100, 1500, 900)
+        self.settings = QSettings("OscilloscopePalantir", "OscilloscopePalantir")
 
         self.accent = "#00aaff"
         self.dark_mode = True
@@ -1566,7 +1567,9 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.canvas.draw()
 
     def select_folder(self):
-        default_dir = '/media/ext_drive/PVDF_Data'
+        default_dir = self.settings.value("last_trc_dir", "", type=str)
+        if not default_dir or not os.path.isdir(default_dir):
+            default_dir = '/media/ext_drive/PVDF_Data'
         #default_dir = '../dust_testing/2025_03_11_run0/'
         #default_dir = './2025_06_09_run1/'
         folder = QFileDialog.getExistingDirectory(
@@ -1627,6 +1630,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.event_combo.clear()
         self.event_combo.addItems(self._all_event_keys)
         self.set_controls_enabled(True)
+        self.settings.setValue("last_trc_dir", folder)
 
     def load_metadata(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1785,6 +1789,17 @@ class OscilloscopeAnalyzer(QMainWindow):
             else:
                     QMessageBox.information(self, "No Next Event", "Already at the last event.")
 
+    def _apply_channel_hotkey(self, ch_text):
+        """Set both dynamic fit and SG channel selectors from a numeric hotkey."""
+        if hasattr(self, "dyn_ch_combo") and self.dyn_ch_combo.isEnabled():
+            idx = self.dyn_ch_combo.findText(ch_text)
+            if idx != -1:
+                self.dyn_ch_combo.setCurrentText(ch_text)
+        if hasattr(self, "sg_ch") and self.sg_ch.isEnabled():
+            idx = self.sg_ch.findText(ch_text)
+            if idx != -1:
+                self.sg_ch.setCurrentText(ch_text)
+
     def keyPressEvent(self, event):  
         if getattr(self, '_shortcuts_installed', False):
             return super().keyPressEvent(event)
@@ -1848,16 +1863,16 @@ class OscilloscopeAnalyzer(QMainWindow):
                 self.dyn_func_combo.setCurrentText("low_pass_max")
         # Channel numeric keys
         elif key in (Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4, Qt.Key_5, Qt.Key_6, Qt.Key_7, Qt.Key_8):
-            if hasattr(self, 'dyn_ch_combo') and self.dyn_ch_combo.isEnabled() and self.dyn_ch_combo.count() > 0:
-                desired = str(key - Qt.Key_0)
-                # Only set if that channel exists in the combo
-                idx = self.dyn_ch_combo.findText(desired)
-                if idx != -1:
-                    self.dyn_ch_combo.setCurrentText(desired)
+            desired = str(key - Qt.Key_0)
+            self._apply_channel_hotkey(desired)
         # Invert toggle
         elif key == Qt.Key_I:
             if hasattr(self, 'dyn_invert') and self.dyn_invert.isEnabled():
                 self.dyn_invert.setChecked(not self.dyn_invert.isChecked())
+        # Reset axes
+        elif key == Qt.Key_Space:
+            if hasattr(self, 'btn_reset_axes') and self.btn_reset_axes.isEnabled():
+                self.reset_axis_limits()
         # Run / adjust
         elif key in (Qt.Key_Return, Qt.Key_Enter):
             if hasattr(self, 'btn_dyn') and self.btn_dyn.isEnabled():
@@ -1891,6 +1906,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         add_shortcut(Qt.Key_M, lambda: (self.btn_meta.isEnabled() and self.run_meta_match()))
         add_shortcut(Qt.Key_T, lambda: (self.btn_mark_impact.isEnabled() and self.mark_impact_line()))
         add_shortcut(Qt.Key_R, lambda: (self.btn_clear_dyn.isEnabled() and self.clear_dynamic_fit()))
+        add_shortcut(Qt.Key_Space, lambda: (self.btn_reset_axes.isEnabled() and self.reset_axis_limits()))
         # Additional accelerators
         add_shortcut(Qt.CTRL + Qt.Key_S, lambda: (self.btn_save_fig.isEnabled() and self.save_figure_transparent()))
         add_shortcut(Qt.CTRL + Qt.Key_E, lambda: (self.btn_export.isEnabled() and self.export_fits()))
@@ -1922,11 +1938,9 @@ class OscilloscopeAnalyzer(QMainWindow):
         # Shift+F selects FFT without overriding plain F (Select Folder)
         add_shortcut(Qt.SHIFT + Qt.Key_F, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("FFT")))
 
-        # Channel selection 1-4
-        for n in (1, 2, 3, 4):
-            add_shortcut(Qt.Key_0 + n, lambda n=n: (
-                self.dyn_ch_combo.isEnabled() and self.dyn_ch_combo.findText(str(n)) != -1 and self.dyn_ch_combo.setCurrentText(str(n))
-            ))
+        # Channel selection for both dynamic fit and SG filter
+        for n in range(1, 9):
+            add_shortcut(Qt.Key_0 + n, lambda n=n: self._apply_channel_hotkey(str(n)))
 
         # Invert toggle
         add_shortcut(Qt.Key_I, lambda: (self.dyn_invert.isEnabled() and self.dyn_invert.setChecked(not self.dyn_invert.isChecked())))
@@ -4893,6 +4907,19 @@ class OscilloscopeAnalyzer(QMainWindow):
             idx = 0
         if idx != -1:
             self.event_combo.setCurrentIndex(idx)
+
+    def closeEvent(self, event):
+        reply = QMessageBox.question(
+            self,
+            "Exit Oscilloscope Palantir",
+            "Are you sure you want to exit?\nUnsaved fits and results will be lost.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            event.accept()
+        else:
+            event.ignore()
 
     #Implement qd3 batch routine with progress dialog and cancellation:
     def show_help(self):
