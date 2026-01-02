@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QDoubleSpinBox, QSpinBox,
     QPushButton, QComboBox, QFileDialog, QMessageBox, QLabel, QCheckBox, QDialog, QInputDialog,
     QProgressDialog, QSizePolicy, QTableWidget, QTableWidgetItem, QLineEdit, QDialogButtonBox,
-    QListWidget, QListWidgetItem)
+    QListWidget, QListWidgetItem, QToolButton, QMenu)
 
 import qtawesome as qta
 
@@ -90,6 +90,9 @@ matplotlib.rcParams['axes.labelsize']  = 12
 matplotlib.rcParams['xtick.labelsize'] = 10
 matplotlib.rcParams['ytick.labelsize'] = 10
 matplotlib.rcParams['axes.grid']       = True
+
+btn_height = 24
+btn_width  = 60
 
 class FitInfoWindow(QWidget):
     """Window showing fit results."""
@@ -1003,8 +1006,11 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.sg_filtered     = {}
         self.sg_filtered_meta = {}
         self.sg_cache_dir    = None
-        # Persist user-defined axis limits per channel between event redraws
+        # Persist user-defined axis limits per channel when preservation is enabled
         self.channel_axis_limits = {}
+        self.preserve_axes_channels = set()
+        self._preserve_axis_actions = {}
+        self._preserve_axes_menu_channels = [1, 2, 3, 4]
         self._suspend_axis_capture = False
         self.metaArr         = None
         self._fit_color_map  = dict(FIT_COLOR_PRESETS)
@@ -1024,7 +1030,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             lay.addWidget(control)
             w.setFixedWidth(self.unit_width)
             # Keep compact row height for wrapped controls
-            w.setMaximumHeight(24)
+            w.setMaximumHeight(btn_height)
             return w
 
         central = QWidget()
@@ -1050,22 +1056,28 @@ class OscilloscopeAnalyzer(QMainWindow):
         btn_folder.clicked.connect(self.select_folder)
         btn_folder.setFixedWidth(self.unit_width)
         ctrl_layout.addWidget(btn_folder)
+        ctrl_layout.addSpacing(2)
 
+        # Event number selector
         self.event_combo = QComboBox()
         self.event_combo.currentIndexChanged.connect(self.load_event)
         self.event_combo.setFixedWidth(self.unit_width)
         ctrl_layout.addWidget(self.event_combo)
+        ctrl_layout.addSpacing(2)
 
+        # Quality Assignment
         self.quality_spin = QSpinBox()
         self.quality_spin.setRange(0, 5)
         self.quality_spin.setValue(0)
         self.quality_spin.setToolTip("Assign quality 1-5 to current event (0 = unset)")
         self.quality_spin.valueChanged.connect(self._on_quality_changed)
-        ctrl_layout.addWidget(wrap_control("Quality", self.quality_spin))
+        self.quality_spin.setFixedWidth(btn_width)
+        self.quality_spin.setMaximumHeight(btn_height)
+        ctrl_layout.addWidget(wrap_control("Quality:", self.quality_spin))
 
-        self.quality_hint = QLabel("Use Quality to tag current event (auto-saved per dataset).")
-        self.quality_hint.setStyleSheet("font-size: 11px; color: #999999;")
-        ctrl_layout.addWidget(self.quality_hint)
+        #self.quality_hint = QLabel("Use Quality to tag current event (auto-saved per dataset).")
+        #self.quality_hint.setStyleSheet("font-size: 11px; color: #999999;")
+        #ctrl_layout.addWidget(self.quality_hint)
 
         # Label to display the currently selected source folder
         self.folder_label = QLabel("Select Folder To Continue")
@@ -1096,7 +1108,7 @@ class OscilloscopeAnalyzer(QMainWindow):
 
         # Row: Navigation / Plotting (right-aligned session controls)
         nav_layout = QHBoxLayout()
-        nav_layout.setContentsMargins(0, 0, 0, 0)
+        #nav_layout.setContentsMargins(0, 0, 0, 0)
         nav_layout.setSpacing(6)
         layout.addLayout(nav_layout)
         layout.setAlignment(nav_layout, Qt.AlignLeft)
@@ -1107,7 +1119,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_prev.setToolTip("Load previous event (<)")
         self.btn_prev.clicked.connect(self.prev_event)
         self.btn_prev.setFixedWidth(self.unit_width)
-        self.btn_prev.setMaximumHeight(24)
+        self.btn_prev.setMaximumHeight(btn_height)
         nav_layout.addWidget(self.btn_prev)
 
         # Button to iterate to next trc files.
@@ -1116,7 +1128,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_next.setToolTip("Load next event (>)")
         self.btn_next.clicked.connect(self.next_event)
         self.btn_next.setFixedWidth(self.unit_width)
-        self.btn_next.setMaximumHeight(24)
+        self.btn_next.setMaximumHeight(btn_height)
         nav_layout.addWidget(self.btn_next)
 
         # Decimation factor for plotting
@@ -1125,16 +1137,17 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.decim_spin.setValue(2)
         self.decim_spin.setToolTip("Plot every Nth sample; 1=all data, larger values skip more points")
         self.decim_spin.valueChanged.connect(self._on_decim_change)
-        self.decim_spin.setFixedWidth(60)
-        self.decim_spin.setMaximumHeight(24)
+        self.decim_spin.setFixedWidth(btn_width)
+        self.decim_spin.setMaximumHeight(btn_height)
         nav_layout.addWidget(wrap_control("Decim:", self.decim_spin))
 
+        # Co-Add waveforms
         self.btn_coadd = QPushButton("Co-Add Waves")
         self.btn_coadd.setIcon(qta.icon('fa5s.layer-group', color=self.accent))
         self.btn_coadd.setToolTip("Combine selected events into a summed or averaged waveform")
         self.btn_coadd.clicked.connect(self.coadd_waveforms)
         self.btn_coadd.setFixedWidth(self.unit_width)
-        self.btn_coadd.setMaximumHeight(24)
+        self.btn_coadd.setMaximumHeight(btn_height)
         nav_layout.addWidget(self.btn_coadd)
 
         nav_layout.addStretch()
@@ -1145,7 +1158,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_clear.setToolTip("Remove all fits on this event (E)")
         self.btn_clear.clicked.connect(self.clear_fits)
         self.btn_clear.setFixedWidth(self.unit_width)
-        self.btn_clear.setMaximumHeight(24)
+        self.btn_clear.setMaximumHeight(btn_height)
         nav_layout.addWidget(self.btn_clear)
 
         self.btn_save_fig = QPushButton("Save Figure")
@@ -1153,7 +1166,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_save_fig.setToolTip("Save current plot as an image (Ctrl+S)")
         self.btn_save_fig.clicked.connect(self.save_figure_transparent)
         self.btn_save_fig.setFixedWidth(self.unit_width)
-        self.btn_save_fig.setMaximumHeight(24)
+        self.btn_save_fig.setMaximumHeight(btn_height)
         nav_layout.addWidget(self.btn_save_fig)
 
         self.btn_export = QPushButton("Export Fits")
@@ -1161,7 +1174,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_export.setToolTip("Export all fits to an HDF5 file (Ctrl+E)")
         self.btn_export.clicked.connect(self.export_fits)
         self.btn_export.setFixedWidth(self.unit_width)
-        self.btn_export.setMaximumHeight(24)
+        self.btn_export.setMaximumHeight(btn_height)
         nav_layout.addWidget(self.btn_export)
 
         self.btn_import = QPushButton("Load Fits")
@@ -1169,7 +1182,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_import.setToolTip("Load fits from an HDF5 file and merge into session (Ctrl+I)")
         self.btn_import.clicked.connect(self.import_fits)
         self.btn_import.setFixedWidth(self.unit_width)
-        self.btn_import.setMaximumHeight(24)
+        self.btn_import.setMaximumHeight(btn_height)
         nav_layout.addWidget(self.btn_import)
 
         self.btn_clear_data = QPushButton("Clear Data")
@@ -1177,7 +1190,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_clear_data.setToolTip("Remove loaded data and ALL fits (Shift+D)")
         self.btn_clear_data.clicked.connect(self.clear_data)
         self.btn_clear_data.setFixedWidth(self.unit_width)
-        self.btn_clear_data.setMaximumHeight(24)
+        self.btn_clear_data.setMaximumHeight(btn_height)
         nav_layout.addWidget(self.btn_clear_data)
 
         self.btn_show_info = QPushButton("Fit Info (U)")
@@ -1185,7 +1198,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_show_info.setToolTip("Show table of all fit results (U)")
         self.btn_show_info.clicked.connect(self.show_fit_info)
         self.btn_show_info.setFixedWidth(self.unit_width)
-        self.btn_show_info.setMaximumHeight(24)
+        self.btn_show_info.setMaximumHeight(btn_height)
         nav_layout.addWidget(self.btn_show_info)
 
         # Row: Metadata / Impact
@@ -1217,7 +1230,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.dist_spin.setDecimals(3)
         self.dist_spin.setSingleStep(0.001)
         self.dist_spin.setValue(1.51)                # Det3 to Center LEIL m (Defaults ~ 1.82)
-        self.dist_spin.setFixedWidth(60)
+        self.dist_spin.setFixedWidth(btn_width)
         dist_widget = wrap_control("D3Dist:", self.dist_spin)
         dist_widget.findChild(QLabel).setToolTip("Det3 to Target distance (m)")
         meta_layout.addWidget(dist_widget)
@@ -1248,6 +1261,8 @@ class OscilloscopeAnalyzer(QMainWindow):
         sg_layout.setSpacing(6)
         layout.addLayout(sg_layout)
         layout.setAlignment(sg_layout, Qt.AlignLeft)
+        sg_spacing = max(0, sg_layout.spacing())
+        preserve_axes_spacing = max(0, sg_spacing - 2)
 
         # Savitzky-Golay
         self.btn_sg = QPushButton("(S)G Filter")
@@ -1255,7 +1270,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_sg.setToolTip("Apply Savitzky-Golay filter (S)")
         self.btn_sg.clicked.connect(self.run_sg_filter)
         self.btn_sg.setFixedWidth(self.unit_width)
-        self.btn_sg.setMaximumHeight(24)
+        self.btn_sg.setMaximumHeight(btn_height)
         sg_layout.addWidget(self.btn_sg)
 
         #Channel selector label
@@ -1263,7 +1278,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.sg_ch = QComboBox()
         self.sg_ch.addItems([str(i) for i in range(1,5)])
         self.sg_ch.setCurrentText("1")
-        self.sg_ch.setMaximumHeight(24)
+        self.sg_ch.setMaximumHeight(btn_height)
         self.sg_ch.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         sg_layout.addWidget(wrap_control("Chan:", self.sg_ch))
 
@@ -1271,9 +1286,9 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.sg_win = QSpinBox()
         self.sg_win.setRange(10,9999)
         self.sg_win.setSingleStep(2)
-        self.sg_win.setValue(200)
-        self.sg_win.setFixedWidth(60)
-        self.sg_win.setMaximumHeight(24)
+        self.sg_win.setValue(201)
+        self.sg_win.setFixedWidth(btn_width)
+        self.sg_win.setMaximumHeight(btn_height)
         sg_layout.addWidget(wrap_control("Width:", self.sg_win))
 
         # Button for batch csa
@@ -1281,7 +1296,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_batch_sg.setIcon(qta.icon('fa5s.play', color=self.accent))
         self.btn_batch_sg.setToolTip("Run SG filter on all events (Ctrl+B)")
         self.btn_batch_sg.setFixedWidth(self.unit_width)
-        self.btn_batch_sg.setMaximumHeight(24)
+        self.btn_batch_sg.setMaximumHeight(btn_height)
         self.btn_batch_sg.clicked.connect(self.run_batch_sg_filter)
         sg_layout.addWidget(self.btn_batch_sg)
 
@@ -1291,16 +1306,26 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_clear_sg.setToolTip("Remove SG filter overlay (Shift+S)")
         self.btn_clear_sg.clicked.connect(self.clear_sg_filter)
         self.btn_clear_sg.setFixedWidth(self.unit_width)
-        self.btn_clear_sg.setMaximumHeight(24)
-        sg_layout.addWidget(self.btn_clear_sg)
+        self.btn_clear_sg.setMaximumHeight(btn_height)
 
-        self.btn_reset_axes = QPushButton("Reset Axes")
-        self.btn_reset_axes.setIcon(qta.icon('fa5s.expand', color=self.accent))
-        self.btn_reset_axes.setToolTip("Clear saved axis limits and return to auto-scaling")
-        self.btn_reset_axes.setFixedWidth(self.unit_width)
-        self.btn_reset_axes.setMaximumHeight(24)
-        self.btn_reset_axes.clicked.connect(lambda: self.reset_axis_limits())
-        sg_layout.addWidget(self.btn_reset_axes)
+        # Drop down to select plotted domain/range preservation
+        self.preserve_axes_button = QToolButton()
+        self.preserve_axes_button.setIcon(qta.icon('fa5s.expand', color=self.accent))
+        self.preserve_axes_button.setText("Preserve Axes")
+        self.preserve_axes_button.setToolTip("Choose which channels keep zoom/pan limits across events")
+        self.preserve_axes_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.preserve_axes_button.setPopupMode(QToolButton.InstantPopup)
+        self.preserve_axes_button.setFixedWidth((2 * self.unit_width) + preserve_axes_spacing)
+        self.preserve_axes_button.setMaximumHeight(btn_height)
+        self.preserve_axes_menu = QMenu(self)
+        self.preserve_axes_button.setMenu(self.preserve_axes_menu)
+        self._rebuild_preserve_axes_menu()
+        clear_preserve_layout = QHBoxLayout()
+        clear_preserve_layout.setContentsMargins(0, 0, 0, 0)
+        clear_preserve_layout.setSpacing(preserve_axes_spacing)
+        clear_preserve_layout.addWidget(self.btn_clear_sg)
+        clear_preserve_layout.addWidget(self.preserve_axes_button)
+        sg_layout.addLayout(clear_preserve_layout)
 
         # Right-aligned scanning/filtering controls on same row
         sg_layout.addStretch()
@@ -1310,14 +1335,14 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_results_plotter.setToolTip("Open Results Plotter using current in-memory fits (P)")
         self.btn_results_plotter.clicked.connect(self.open_results_plotter)
         self.btn_results_plotter.setFixedWidth(self.unit_width)
-        self.btn_results_plotter.setMaximumHeight(24)
+        self.btn_results_plotter.setMaximumHeight(btn_height)
         sg_layout.addWidget(self.btn_results_plotter)
 
         self.btn_feature_scan = QPushButton("Feature Scan")
         self.btn_feature_scan.setIcon(qta.icon('fa5s.search-plus', color=self.accent))
         self.btn_feature_scan.setToolTip("Scan events for large excursions vs. stddev (Ctrl+F)")
         self.btn_feature_scan.setFixedWidth(self.unit_width)
-        self.btn_feature_scan.setMaximumHeight(24)
+        self.btn_feature_scan.setMaximumHeight(btn_height)
         self.btn_feature_scan.clicked.connect(self.run_feature_scan)
         sg_layout.addWidget(self.btn_feature_scan)
 
@@ -1325,7 +1350,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_fit_filter.setIcon(qta.icon('fa5s.filter', color=self.accent))
         self.btn_fit_filter.setToolTip("Filter events where a fit parameter meets a criterion (Ctrl+Shift+F)")
         self.btn_fit_filter.setFixedWidth(self.unit_width)
-        self.btn_fit_filter.setMaximumHeight(24)
+        self.btn_fit_filter.setMaximumHeight(btn_height)
         self.btn_fit_filter.clicked.connect(self.run_fit_filter)
         sg_layout.addWidget(self.btn_fit_filter)
 
@@ -1333,7 +1358,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_quality_filter.setIcon(qta.icon('fa5s.star', color=self.accent))
         self.btn_quality_filter.setToolTip("Filter events with quality ≥ threshold")
         self.btn_quality_filter.setFixedWidth(self.unit_width)
-        self.btn_quality_filter.setMaximumHeight(24)
+        self.btn_quality_filter.setMaximumHeight(btn_height)
         self.btn_quality_filter.clicked.connect(self.run_quality_filter)
         sg_layout.addWidget(self.btn_quality_filter)
 
@@ -1341,7 +1366,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_clear_filter.setIcon(qta.icon('fa5s.undo', color=self.accent))
         self.btn_clear_filter.setToolTip("Restore the full event list (Ctrl+K)")
         self.btn_clear_filter.setFixedWidth(self.unit_width)
-        self.btn_clear_filter.setMaximumHeight(24)
+        self.btn_clear_filter.setMaximumHeight(btn_height)
         self.btn_clear_filter.clicked.connect(self.clear_event_filter)
         sg_layout.addWidget(self.btn_clear_filter)
 
@@ -1356,14 +1381,14 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.dyn_func_combo.addItems(sorted(FIT_LIB.keys()))
         self.dyn_func_combo.setToolTip("Q=QD3Fit, D=QDMFit, C=CSA_pulse, W=skew_gaussian, G=gaussian, Shift+F=FFT, X=low_pass_max")
         self.dyn_func_combo.setFixedWidth(self.unit_width+2)
-        self.dyn_func_combo.setMaximumHeight(24)
+        self.dyn_func_combo.setMaximumHeight(btn_height)
         ctrl_layout5.addWidget(self.dyn_func_combo)
 
         # Channel selection then optional invert
         self.dyn_ch_combo = QComboBox()
         self.dyn_ch_combo.addItems([str(i) for i in range(1,5)])
         self.dyn_ch_combo.setCurrentText("1")
-        self.dyn_ch_combo.setMaximumHeight(24)
+        self.dyn_ch_combo.setMaximumHeight(btn_height)
         self.dyn_ch_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         ctrl_layout5.addWidget(wrap_control("Chan:", self.dyn_ch_combo))
         # Small gap between channel and invert
@@ -1371,15 +1396,15 @@ class OscilloscopeAnalyzer(QMainWindow):
 
         self.dyn_invert = QCheckBox(":(I)nvert")
         self.dyn_invert.setFixedWidth(self.unit_width+2)
-        self.dyn_invert.setMaximumHeight(24)
+        self.dyn_invert.setMaximumHeight(btn_height)
         ctrl_layout5.addWidget(self.dyn_invert)
 
         self.dyn_decim_spin = QSpinBox()
         self.dyn_decim_spin.setRange(1, 10000)
         self.dyn_decim_spin.setValue(1)
         self.dyn_decim_spin.setToolTip("Downsample fit data; 1=all points, larger values skip more samples")
-        self.dyn_decim_spin.setFixedWidth(60)
-        self.dyn_decim_spin.setMaximumHeight(24)
+        self.dyn_decim_spin.setFixedWidth(btn_width)
+        self.dyn_decim_spin.setMaximumHeight(btn_height)
         ctrl_layout5.addWidget(wrap_control("Fit Decim:", self.dyn_decim_spin))
 
         # Primary fit actions
@@ -1389,7 +1414,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_dyn.setToolTip("Execute selected fit (Return)")
         self.btn_dyn.clicked.connect(self.run_dynamic_fit)
         self.btn_dyn.setFixedWidth(self.unit_width)
-        self.btn_dyn.setMaximumHeight(24)
+        self.btn_dyn.setMaximumHeight(btn_height)
         ctrl_layout5.addWidget(self.btn_dyn)
 
         self.btn_adjust_dyn = QPushButton("(A)djust Fit")
@@ -1397,7 +1422,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_adjust_dyn.setToolTip("Edit initial parameters (A)")
         self.btn_adjust_dyn.clicked.connect(self.adjust_dynamic_params)
         self.btn_adjust_dyn.setFixedWidth(self.unit_width)
-        self.btn_adjust_dyn.setMaximumHeight(24)
+        self.btn_adjust_dyn.setMaximumHeight(btn_height)
         ctrl_layout5.addWidget(self.btn_adjust_dyn)
 
         self.btn_clear_dyn = QPushButton("Clea(r) Fit")
@@ -1405,7 +1430,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_clear_dyn.setToolTip("Remove dynamic fit (R)")
         self.btn_clear_dyn.clicked.connect(self.clear_dynamic_fit)
         self.btn_clear_dyn.setFixedWidth(self.unit_width)
-        self.btn_clear_dyn.setMaximumHeight(24)
+        self.btn_clear_dyn.setMaximumHeight(btn_height)
         ctrl_layout5.addWidget(self.btn_clear_dyn)
 
         # Clear all fits for selected channel on current event
@@ -1414,7 +1439,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_clear_chan.setToolTip("Remove all fits for selected channel on this event (Shift+R)")
         self.btn_clear_chan.clicked.connect(self.clear_channel_fits)
         self.btn_clear_chan.setFixedWidth(self.unit_width)
-        self.btn_clear_chan.setMaximumHeight(24)
+        self.btn_clear_chan.setMaximumHeight(btn_height)
         ctrl_layout5.addWidget(self.btn_clear_chan)
 
         # Batch run across multiple events for the selected fit/channel
@@ -1423,14 +1448,14 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_batch_dyn.setToolTip("Run selected fit over a time window across a range of events (B)")
         self.btn_batch_dyn.clicked.connect(self.run_batch_fit)
         self.btn_batch_dyn.setFixedWidth(self.unit_width)
-        self.btn_batch_dyn.setMaximumHeight(24)
+        self.btn_batch_dyn.setMaximumHeight(btn_height)
         ctrl_layout5.addWidget(self.btn_batch_dyn)
 
         # Optional: use SG-filtered data if present when running fits/FFT (moved to end)
         self.use_sg_toggle = QCheckBox("Use SG")
         self.use_sg_toggle.setToolTip("Use SG-filtered data if available for fits/FFT (Ctrl+Shift+S)")
         self.use_sg_toggle.setFixedWidth(self.unit_width+2)
-        self.use_sg_toggle.setMaximumHeight(24)
+        self.use_sg_toggle.setMaximumHeight(btn_height)
         ctrl_layout5.addWidget(self.use_sg_toggle)
 
         ctrl_layout5.addStretch()
@@ -1471,7 +1496,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             self.btn_clear, self.btn_save_fig, self.btn_export, self.btn_import,
             self.btn_clear_data, self.btn_show_info,
             self.btn_sg, self.sg_ch, self.sg_win,
-            self.btn_batch_sg, self.btn_clear_sg, self.btn_reset_axes, self.btn_results_plotter, self.btn_feature_scan, self.btn_fit_filter, self.btn_quality_filter, self.btn_clear_filter,
+            self.btn_batch_sg, self.btn_clear_sg, self.preserve_axes_button, self.btn_results_plotter, self.btn_feature_scan, self.btn_fit_filter, self.btn_quality_filter, self.btn_clear_filter,
             self.dyn_func_combo, self.btn_dyn, self.btn_batch_dyn, self.dyn_ch_combo,
             self.dyn_invert, self.dyn_decim_spin, self.use_sg_toggle, self.btn_adjust_dyn, self.btn_clear_dyn, self.btn_clear_chan
         ]
@@ -1521,6 +1546,15 @@ class OscilloscopeAnalyzer(QMainWindow):
                 border-radius: 3px;
             }}
             QPushButton:hover {{
+                background-color: {button_hover};
+            }}
+            QToolButton {{
+                background-color: {button_bg};
+                border: 1px solid {self.accent};
+                padding: 4px;
+                border-radius: 3px;
+            }}
+            QToolButton:hover {{
                 background-color: {button_hover};
             }}
             QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit, QTextEdit, QTableWidget {{
@@ -1869,10 +1903,10 @@ class OscilloscopeAnalyzer(QMainWindow):
         elif key == Qt.Key_I:
             if hasattr(self, 'dyn_invert') and self.dyn_invert.isEnabled():
                 self.dyn_invert.setChecked(not self.dyn_invert.isChecked())
-        # Reset axes
+        # Preserve axes (toggle all)
         elif key == Qt.Key_Space:
-            if hasattr(self, 'btn_reset_axes') and self.btn_reset_axes.isEnabled():
-                self.reset_axis_limits()
+            if hasattr(self, 'preserve_axes_button') and self.preserve_axes_button.isEnabled():
+                self._toggle_preserve_axes_all()
         # Run / adjust
         elif key in (Qt.Key_Return, Qt.Key_Enter):
             if hasattr(self, 'btn_dyn') and self.btn_dyn.isEnabled():
@@ -1906,7 +1940,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         add_shortcut(Qt.Key_M, lambda: (self.btn_meta.isEnabled() and self.run_meta_match()))
         add_shortcut(Qt.Key_T, lambda: (self.btn_mark_impact.isEnabled() and self.mark_impact_line()))
         add_shortcut(Qt.Key_R, lambda: (self.btn_clear_dyn.isEnabled() and self.clear_dynamic_fit()))
-        add_shortcut(Qt.Key_Space, lambda: (self.btn_reset_axes.isEnabled() and self.reset_axis_limits()))
+        add_shortcut(Qt.Key_Space, lambda: (self.preserve_axes_button.isEnabled() and self._toggle_preserve_axes_all()))
         # Additional accelerators
         add_shortcut(Qt.CTRL + Qt.Key_S, lambda: (self.btn_save_fig.isEnabled() and self.save_figure_transparent()))
         add_shortcut(Qt.CTRL + Qt.Key_E, lambda: (self.btn_export.isEnabled() and self.export_fits()))
@@ -1952,6 +1986,8 @@ class OscilloscopeAnalyzer(QMainWindow):
 
     def _apply_saved_axis_limits(self, ax, ch):
         """Restore persisted axis limits for a channel, if any."""
+        if not self._preserve_axes_enabled(ch):
+            return
         limits = self.channel_axis_limits.get(ch)
         if not limits:
             return
@@ -1974,6 +2010,132 @@ class OscilloscopeAnalyzer(QMainWindow):
             self.channel_axis_limits.pop(channel, None)
         self._refresh_current_event_plots()
         self.canvas.draw_idle()
+
+    def _preserve_axes_enabled(self, channel):
+        return channel in self.preserve_axes_channels
+
+    def _preserve_axes_channel_list(self):
+        return list(self._preserve_axes_menu_channels)
+
+    def _format_preserve_axes_indicator(self):
+        channels = sorted(self.preserve_axes_channels)
+        if not channels:
+            return ""
+        ranges = []
+        start = prev = channels[0]
+        for ch in channels[1:]:
+            if ch == prev + 1:
+                prev = ch
+                continue
+            ranges.append((start, prev))
+            start = prev = ch
+        ranges.append((start, prev))
+        parts = []
+        for start, end in ranges:
+            if start == end:
+                parts.append(str(start))
+            else:
+                parts.append(f"{start}-{end}")
+        return " • " + ",".join(parts)
+
+    def _update_preserve_axes_button_text(self):
+        base_label = "Preserve Axes"
+        suffix = self._format_preserve_axes_indicator()
+        label = base_label + suffix
+        if not suffix:
+            tip = "Choose which channels keep zoom/pan limits across events"
+        else:
+            tip = f"Preserving channels: {suffix.replace(' • ', '')}. Click to edit."
+        self.preserve_axes_button.setText(label)
+        self.preserve_axes_button.setToolTip(tip)
+
+    def _rebuild_preserve_axes_menu(self, channels=None):
+        if channels is None:
+            channels = self._preserve_axes_menu_channels
+        channels = sorted({int(ch) for ch in channels if ch is not None})
+        if not channels:
+            channels = [1, 2, 3, 4]
+        self._preserve_axes_menu_channels = channels
+        self.preserve_axes_menu.clear()
+        all_action = self.preserve_axes_menu.addAction("All Channels")
+        all_action.triggered.connect(self._select_all_preserve_axes)
+        none_action = self.preserve_axes_menu.addAction("No Channels")
+        none_action.triggered.connect(self._clear_preserve_axes)
+        self.preserve_axes_menu.addSeparator()
+        self._preserve_axis_actions = {}
+        for ch in channels:
+            action = self.preserve_axes_menu.addAction(f"Channel {ch}")
+            action.setCheckable(True)
+            action.setChecked(ch in self.preserve_axes_channels)
+            action.toggled.connect(lambda checked, ch=ch: self._on_preserve_axes_channel_toggled(ch, checked))
+            self._preserve_axis_actions[ch] = action
+        self._update_preserve_axes_button_text()
+
+    def _set_preserve_axes_channels(self, channels):
+        channels = {int(ch) for ch in channels if ch is not None}
+        removed = self.preserve_axes_channels - channels
+        self.preserve_axes_channels = set(channels)
+        for ch, action in self._preserve_axis_actions.items():
+            action.blockSignals(True)
+            action.setChecked(ch in self.preserve_axes_channels)
+            action.blockSignals(False)
+        for ch in list(self.channel_axis_limits.keys()):
+            if ch not in self.preserve_axes_channels:
+                self.channel_axis_limits.pop(ch, None)
+        self._update_preserve_axes_button_text()
+        if removed:
+            self._refresh_current_event_plots()
+
+    def _select_all_preserve_axes(self):
+        channels = self._preserve_axes_channel_list()
+        if not channels:
+            return
+        self._set_preserve_axes_channels(channels)
+        self._capture_current_axis_limits(channels=set(channels))
+
+    def _clear_preserve_axes(self):
+        self._set_preserve_axes_channels(set())
+
+    def _toggle_preserve_axes_all(self):
+        channels = self._preserve_axes_channel_list()
+        if not channels:
+            return
+        if self.preserve_axes_channels.issuperset(channels):
+            self._clear_preserve_axes()
+        else:
+            self._select_all_preserve_axes()
+
+    def _on_preserve_axes_channel_toggled(self, channel, checked):
+        if checked:
+            self.preserve_axes_channels.add(channel)
+            self._capture_current_axis_limits(channels={channel})
+        else:
+            self.preserve_axes_channels.discard(channel)
+            self.channel_axis_limits.pop(channel, None)
+            self._refresh_current_event_plots()
+        self._update_preserve_axes_button_text()
+
+    def _capture_current_axis_limits(self, only_missing=False, channels=None):
+        if not self.current_data:
+            return
+        if not self.figure.axes:
+            return
+        if channels is None:
+            channels = self.preserve_axes_channels
+        channels = set(channels)
+        if not channels:
+            return
+        for ax, ch in self._axis_to_channel.items():
+            if ch is None:
+                continue
+            if ch not in channels:
+                continue
+            if only_missing and ch in self.channel_axis_limits:
+                continue
+            self.channel_axis_limits[ch] = {
+                'xlim': tuple(ax.get_xlim()),
+                'ylim': tuple(ax.get_ylim()),
+            }
 
     def _refresh_current_event_plots(self):
         """Replot current event waveforms and overlays using stored data."""
@@ -2019,7 +2181,7 @@ class OscilloscopeAnalyzer(QMainWindow):
 
     def _store_axis_limits_from_axes(self, ax):
         ch = self._axis_to_channel.get(ax)
-        if ch is None:
+        if ch is None or not self._preserve_axes_enabled(ch):
             return
         limits = self.channel_axis_limits.setdefault(ch, {'xlim': None, 'ylim': None})
         limits['xlim'] = tuple(ax.get_xlim())
@@ -2170,6 +2332,8 @@ class OscilloscopeAnalyzer(QMainWindow):
                 )
                 self.span_selectors[ch] = sel
             self.figure.tight_layout()
+            if self.preserve_axes_channels:
+                self._capture_current_axis_limits(only_missing=True)
             self.canvas.draw()
         finally:
             self._suspend_axis_capture = False
@@ -5014,12 +5178,12 @@ class OscilloscopeAnalyzer(QMainWindow):
             "• Select Folder (F), Event dropdown, Folder path label.\n"
             "• Navigation: Prev/Next (, .), Decim.  Session: Clear Event Fits (E), Save (Ctrl+S), Export (Ctrl+E), Load (Ctrl+I), Clear Data (Shift+D), Fit Info (U).\n"
             "• Metadata/Impact: Load Metadata (L), MetaMatch (M), D3Dist, Mark Impact (T).\n"
-            "• SG Row: SG Filter (S), Chan, Width, SG Batch (Ctrl+B), Clear SG (Shift+S), Reset Axes | Results Plotter (P), Feature Scan (Ctrl+F), Fit Filter (Ctrl+Shift+F), Clear Filter (Ctrl+K).\n"
+            "• SG Row: SG Filter (S), Chan, Width, SG Batch (Ctrl+B), Clear SG (Shift+S), Preserve Axes (menu) | Results Plotter (P), Feature Scan (Ctrl+F), Fit Filter (Ctrl+Shift+F), Clear Filter (Ctrl+K).\n"
             "• Dynamic Row: Fit Func (QD3Fit/QDMFit/CSA/skew_gaussian/gaussian/FFT/low_pass_max), Chan (1–8), Invert (I), Run (Enter), Adjust (A), Clear (R), Clear Chan Fits (Shift+R), Batch (B), Use SG (Ctrl+Shift+S).\n\n"
             "Notes:\n"
             "• Fits run on raw data by default; QD3/QDM use SG only for initial parameter guessing.\n"
             "• SG Batch runs multi-threaded and caches filtered traces (per channel + window) for rapid recall; clearing SG removes the cached trace for that channel/event.\n"
-            "• Reset Axes clears saved zoom/pan ranges so the next redraw returns to auto-scaling.\n"
+            "• Preserve Axes selects which channels keep zoom/pan ranges across events; unselected channels auto-scale.\n"
             "• ‘Use SG’ applies SG-filtered data (if present) to Run Fit, Adjust Fit, and FFT.\n"
             "• FFT opens a popup spectrum with pan/zoom toolbar in log–log scale.\n"
             "• low_pass_max performs an SG low‑pass in the selection and reports the extremum.\n\n"
