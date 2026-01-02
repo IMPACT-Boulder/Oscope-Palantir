@@ -1,8 +1,4 @@
-# Open Use License
-#
-# You may use, copy, modify, and redistribute this file for any purpose,
-# provided that redistributions include this original source code (including this notice).
-# This software is provided "as is" without warranty of any kind.
+# SPDX-License-Identifier: MIT
 
 import sys, os, re, traceback, inspect
 import numpy as np
@@ -26,8 +22,11 @@ except Exception:
 # --- Try to load PVDF q(v) calibration CSVs if available ---
 _q_of_v_5 = None
 _q_of_v_9 = None
+_q_of_v_15 = None
 _ELEMENTARY_CHARGE = 1.602176634e-19  # Coulombs per electron
 _E_PER_C = 1.0 / _ELEMENTARY_CHARGE   # electrons per Coulomb
+# Default fraction of the Gaussian peak (above baseline) used to define the integration window.
+_GAUSS_INT_FRAC = 0.10
 _CSA_LINEAR_CAL = {
     "Cremat CSA 3um": (-8.23012166e-13, 2.30821114e-16),   # Q [C] = m*V + b
     "Cremat CSA 8um": (1.02344806e-12, 5.45524781e-15),
@@ -41,6 +40,9 @@ try:
     if os.path.exists('q2v_9-5nf.csv'):
         df_9 = pd.read_csv('q2v_9-5nf.csv')
         _q_of_v_9 = interp1d(df_9['v'].values, df_9['q'].values, kind='linear', fill_value='extrapolate')
+    if os.path.exists('q2v_15nf.csv'):
+        df_15 = pd.read_csv('q2v_15nf.csv')
+        _q_of_v_15 = interp1d(df_15['v'].values, df_15['q'].values, kind='linear', fill_value='extrapolate')
 except Exception:
     pass
 
@@ -48,6 +50,18 @@ except Exception:
 def _sanitize(name: str) -> str:
     """Make a safe, compact suffix from a fit_type like 'CSA_pulse' -> 'csa_pulse'."""
     return re.sub(r'[^0-9a-zA-Z]+', '_', str(name)).strip('_').lower()
+
+
+def _dataset_leaf_name(value) -> str:
+    """Return the last path component of a dataset identifier for concise labeling."""
+    if value is None:
+        return ''
+    s = str(value).strip()
+    if not s:
+        return s
+    s = s.rstrip('/\\')
+    leaf = os.path.basename(s)
+    return leaf or s
 
 
 def _is_numeric(series: pd.Series) -> bool:
@@ -114,6 +128,27 @@ def skew_gaussian_peak_value(A: float, xi: float, omega: float, alpha: float, C:
         return np.nan, np.nan
 
 
+def gaussian_integral_within_frac(A: float, mu: float, sigma: float, C: float = 0.0, frac: float = _GAUSS_INT_FRAC) -> float:
+    """Analytic area of the fitted Gaussian above the baseline C between the ± points where (y-C) = frac*(peak-C).
+
+    Peak above baseline is A at x = μ; the ± bounds are μ ± σ*sqrt(-2 ln(frac)).
+    The baseline-removed integral on that window is A * σ * sqrt(2π) * erf(w/(σ√2))
+    with w = σ*sqrt(-2 ln(frac)). Sign follows the fit amplitude so inverted peaks
+    stay negative. Note: integral value is translation-invariant, so μ only sets
+    the window location, not the magnitude.
+    """
+    try:
+        if not all(np.isfinite(v) for v in (A, sigma)):
+            return np.nan
+        if sigma <= 0 or not (0 < frac < 1):
+            return np.nan
+        tmax = np.sqrt(-2.0 * np.log(frac))  # dimensionless half-width factor
+        area = A * sigma * np.sqrt(2.0 * np.pi) * _erf(tmax / np.sqrt(2.0))
+        return float(area)
+    except Exception:
+        return np.nan
+
+
 class FitResultsVisualizer(QMainWindow):
     """
     Visualizer for HDF5 produced by oscope_palantir.py's Export Fits.
@@ -169,7 +204,12 @@ class FitResultsVisualizer(QMainWindow):
         row2.addWidget(self.ds_combo)
 
         row2.addWidget(QLabel("PVDF q(v) mode:"))
-        pvdf_modes = ['Off', '5nF segmented', '9.5nF monolithic'] + list(_CSA_LINEAR_CAL.keys())
+        pvdf_modes = [
+            'Off',
+            '5nF segmented',
+            '9.5nF monolithic',
+            '15nF (q2v_15nf.csv)',
+        ] + list(_CSA_LINEAR_CAL.keys())
         self.pvdf_combo = QComboBox(); self.pvdf_combo.addItems(pvdf_modes)
         self.pvdf_combo.currentIndexChanged.connect(self.rebuild_groups)  # recalculates derived cols per group
         row2.addWidget(self.pvdf_combo)
@@ -195,6 +235,32 @@ class FitResultsVisualizer(QMainWindow):
         row3.addWidget(self.py_combo)
 
         row3.addStretch()
+
+        # --- Controls row 3b: overlay dataset (optional) ---
+        row3b = QHBoxLayout(); layout.addLayout(row3b)
+        self.chk_overlay = QCheckBox("Overlay second dataset")
+        self.chk_overlay.stateChanged.connect(self.on_overlay_toggle)
+        row3b.addWidget(self.chk_overlay)
+
+        row3b.addSpacing(10)
+
+        row3b.addWidget(QLabel("X frame:"))
+        self.gx2_combo = QComboBox(); self.gx2_combo.currentIndexChanged.connect(self.on_overlay_group_changed)
+        row3b.addWidget(self.gx2_combo)
+        row3b.addWidget(QLabel("X param:"))
+        self.px2_combo = QComboBox(); self.px2_combo.currentIndexChanged.connect(self.update_plot)
+        row3b.addWidget(self.px2_combo)
+
+        row3b.addSpacing(20)
+
+        row3b.addWidget(QLabel("Y frame:"))
+        self.gy2_combo = QComboBox(); self.gy2_combo.currentIndexChanged.connect(self.on_overlay_group_changed)
+        row3b.addWidget(self.gy2_combo)
+        row3b.addWidget(QLabel("Y param:"))
+        self.py2_combo = QComboBox(); self.py2_combo.currentIndexChanged.connect(self.update_plot)
+        row3b.addWidget(self.py2_combo)
+
+        row3b.addStretch()
 
         # --- Controls row 4: scales, fit, export ---
         row4 = QHBoxLayout(); layout.addLayout(row4)
@@ -239,6 +305,7 @@ class FitResultsVisualizer(QMainWindow):
 
         # cache last plotted merged df for linear fit & export
         self.last_plot_df: Optional[pd.DataFrame] = None
+        self.last_overlay_df: Optional[pd.DataFrame] = None
         # interactive selection/removal state
         self._merged_base: Optional[pd.DataFrame] = None
         self._display_to_base = None
@@ -248,8 +315,12 @@ class FitResultsVisualizer(QMainWindow):
         self.removed_indices: set = set()   # base indices
         self._plot_sig: Optional[Tuple[str,str,str,str,str]] = None
         self._scatter = None
+        self._overlay_scatter = None
         self._sel_scatter = None
         self._pick_cid = None
+
+        # Overlay controls start disabled until requested
+        self._set_overlay_controls_enabled(False)
 
         if self.debug:
             print("[INIT] Visualizer ready. CSA_pulse present:", CSA_pulse is not None)
@@ -416,6 +487,33 @@ class FitResultsVisualizer(QMainWindow):
             self.dprint(f"[_maybe_add_skew_peak] failed: {e}")
         return df
 
+    def _maybe_add_gaussian_integral(self, df: pd.DataFrame, frac: float = _GAUSS_INT_FRAC) -> pd.DataFrame:
+        """For gaussian fits, add gauss_int_<pct>: analytic area above baseline within a fixed window.
+
+        Window is μ ± σ * sqrt(-2 ln(frac)), i.e., where the Gaussian remains at
+        least `frac` of its peak above baseline (default 10%). The integral is
+        signed, preserving negative peaks.
+        """
+        req = ['A', 'sigma']  # μ and C are optional for the analytic integral
+        if df.empty or not all(r in df.columns for r in req):
+            return df
+        col_name = f"gauss_int_{int(frac*100)}pct"
+        try:
+            df[col_name] = df.apply(
+                lambda row: gaussian_integral_within_frac(
+                    row['A'],
+                    row['mu'] if 'mu' in df.columns else np.nan,
+                    row['sigma'],
+                    row['C'] if 'C' in df.columns else 0.0,
+                    frac
+                ),
+                axis=1
+            )
+            df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
+        except Exception as e:
+            self.dprint(f"[_maybe_add_gaussian_integral] failed: {e}")
+        return df
+
     def _apply_pvdf_q(self, df: pd.DataFrame) -> pd.DataFrame:
         """Apply PVDF q(v) calibration to an available peak/amplitude column.
 
@@ -429,7 +527,8 @@ class FitResultsVisualizer(QMainWindow):
           • 'pvdf_q'  -> calibrated charge in electrons
           • 'pvdf_q_c' -> same charge in Coulombs
 
-        Supports CSV-derived calibrations (5nF segmented, 9.5nF monolithic) and
+        Supports CSV-derived calibrations (5nF segmented, 9.5nF monolithic, 15nF custom)
+        and
         linear Cremat CSA transfer functions (3um / 8um / 30um).
         """
         mode = self.pvdf_combo.currentText() if self.pvdf_combo is not None else 'Off'
@@ -456,6 +555,9 @@ class FitResultsVisualizer(QMainWindow):
                 pvdf_q_c = pvdf_q_e / _E_PER_C
             elif mode.startswith('9.5nF') and _q_of_v_9 is not None:
                 pvdf_q_e = _q_of_v_9(vals)
+                pvdf_q_c = pvdf_q_e / _E_PER_C
+            elif mode.startswith('15nF') and _q_of_v_15 is not None:
+                pvdf_q_e = _q_of_v_15(vals)
                 pvdf_q_c = pvdf_q_e / _E_PER_C
             elif mode in _CSA_LINEAR_CAL:
                 slope, intercept = _CSA_LINEAR_CAL[mode]
@@ -513,6 +615,8 @@ class FitResultsVisualizer(QMainWindow):
                 g2 = self._maybe_add_csa_derivatives(g2, _sanitize(ft))
             if isinstance(ft, str) and _sanitize(ft) in ('skew_gaussian',):
                 g2 = self._maybe_add_skew_peak(g2)
+            if isinstance(ft, str) and ('gaussian' in _sanitize(ft)):
+                g2 = self._maybe_add_gaussian_integral(g2)
             if isinstance(ft, str) and _sanitize(ft) in ('qd3fit','qdmfit'):
                 g2 = self._maybe_add_qd_cal(g2)
             # Apply PVDF q(v) conversion to any available peak/amp field
@@ -551,6 +655,8 @@ class FitResultsVisualizer(QMainWindow):
         labels = sorted(labels)
         cur_gx = self.gx_combo.currentText() if self.gx_combo.count() else ''
         cur_gy = self.gy_combo.currentText() if self.gy_combo.count() else ''
+        cur_gx2 = self.gx2_combo.currentText() if self.gx2_combo.count() else ''
+        cur_gy2 = self.gy2_combo.currentText() if self.gy2_combo.count() else ''
         self.gx_combo.blockSignals(True); self.gy_combo.blockSignals(True)
         self.gx_combo.clear(); [self.gx_combo.addItem(l) for l in labels]
         self.gy_combo.clear(); [self.gy_combo.addItem(l) for l in labels]
@@ -560,8 +666,18 @@ class FitResultsVisualizer(QMainWindow):
             j = self.gy_combo.findText(cur_gy);  self.gy_combo.setCurrentIndex(j if j>=0 else (1 if self.gy_combo.count()>1 else 0))
         self.gx_combo.blockSignals(False); self.gy_combo.blockSignals(False)
 
+        self.gx2_combo.blockSignals(True); self.gy2_combo.blockSignals(True)
+        self.gx2_combo.clear(); [self.gx2_combo.addItem(l) for l in labels]
+        self.gy2_combo.clear(); [self.gy2_combo.addItem(l) for l in labels]
+        if cur_gx2:
+            j = self.gx2_combo.findText(cur_gx2); self.gx2_combo.setCurrentIndex(j if j>=0 else 0)
+        if cur_gy2:
+            j = self.gy2_combo.findText(cur_gy2); self.gy2_combo.setCurrentIndex(j if j>=0 else (1 if self.gy2_combo.count()>1 else 0))
+        self.gx2_combo.blockSignals(False); self.gy2_combo.blockSignals(False)
+
         # Populate params for current selections
         self._refresh_param_combos()
+        self._refresh_overlay_param_combos()
 
     def _refresh_param_combos(self):
         gx_lbl = self.gx_combo.currentText()
@@ -580,6 +696,30 @@ class FitResultsVisualizer(QMainWindow):
             j = self.py_combo.findText(py_cur); self.py_combo.setCurrentIndex(j if j>=0 else (1 if self.py_combo.count()>1 else 0))
         self.px_combo.blockSignals(False); self.py_combo.blockSignals(False)
 
+    def _refresh_overlay_param_combos(self):
+        if not getattr(self, 'chk_overlay', None):
+            return
+        if not self.chk_overlay.isChecked():
+            self.px2_combo.clear(); self.py2_combo.clear()
+            return
+        gx_lbl = self.gx2_combo.currentText()
+        gy_lbl = self.gy2_combo.currentText()
+        px_cur = self.px2_combo.currentText() if self.px2_combo.count() else ''
+        py_cur = self.py2_combo.currentText() if self.py2_combo.count() else ''
+        self.px2_combo.blockSignals(True); self.py2_combo.blockSignals(True)
+        self.px2_combo.clear(); self.py2_combo.clear()
+        if gx_lbl in self.group_params:
+            for p in self.group_params[gx_lbl]:
+                self.px2_combo.addItem(p)
+        if gy_lbl in self.group_params:
+            for p in self.group_params[gy_lbl]:
+                self.py2_combo.addItem(p)
+        if px_cur:
+            j = self.px2_combo.findText(px_cur); self.px2_combo.setCurrentIndex(j if j>=0 else 0)
+        if py_cur:
+            j = self.py2_combo.findText(py_cur); self.py2_combo.setCurrentIndex(j if j>=0 else (1 if self.py2_combo.count()>1 else 0))
+        self.px2_combo.blockSignals(False); self.py2_combo.blockSignals(False)
+
     def on_dataset_changed(self):
         self._refresh_combos()
         self.update_plot()
@@ -587,6 +727,21 @@ class FitResultsVisualizer(QMainWindow):
     def on_group_changed(self):
         self._refresh_param_combos()
         self.update_plot()
+
+    def on_overlay_toggle(self, _state=None):
+        enabled = bool(self.chk_overlay.isChecked())
+        self._set_overlay_controls_enabled(enabled)
+        self._refresh_overlay_param_combos()
+        self.update_plot()
+
+    def on_overlay_group_changed(self):
+        self._refresh_overlay_param_combos()
+        if self.chk_overlay.isChecked():
+            self.update_plot()
+
+    def _set_overlay_controls_enabled(self, enabled: bool):
+        for widget in (self.gx2_combo, self.px2_combo, self.gy2_combo, self.py2_combo):
+            widget.setEnabled(enabled)
 
     # ---------------- Plotting -----------------
     def _update_status(self, extra: str = ""):
@@ -597,6 +752,17 @@ class FitResultsVisualizer(QMainWindow):
             msg += f" | {extra}"
         self.lbl_status.setText(msg)
         self.dprint("[status]", msg)
+
+    def _axes_group_label(self, label: str) -> str:
+        """Shorten dataset path portions for cleaner axis annotations."""
+        meta = self.group_meta.get(label)
+        if not meta:
+            return label
+        ds, ft, ch = meta
+        ds_leaf = _dataset_leaf_name(ds)
+        ft_str = str(ft) if ft is not None else ''
+        ch_str = str(ch) if ch is not None else ''
+        return f"ds={ds_leaf} | {ft_str} | ch={ch_str}"
 
     def _calc_limits(self, df: pd.DataFrame, x: str, y: str) -> Tuple[Tuple[float,float], Tuple[float,float]]:
         xmin, xmax = np.nanmin(df[x].values), np.nanmax(df[x].values)
@@ -611,12 +777,78 @@ class FitResultsVisualizer(QMainWindow):
             return (lo-0.05*span, hi+0.05*span)
         return margin(xmin,xmax), margin(ymin,ymax)
 
+    def _prepare_xy_dataframe(self, gx_lbl: str, px: str, gy_lbl: str, py: str,
+                              dropna: bool = False, context: str = "") -> pd.DataFrame:
+        """Return merged dataframe with columns X,Y,event,dataset_id for the given group selections."""
+        prefix = f"{context.strip()} " if context else ""
+        if not gx_lbl or gx_lbl not in self.groups:
+            raise ValueError(f"{prefix}X frame unavailable")
+        if not gy_lbl or gy_lbl not in self.groups:
+            raise ValueError(f"{prefix}Y frame unavailable")
+        if not px:
+            raise ValueError(f"{prefix}select an X parameter")
+        if not py:
+            raise ValueError(f"{prefix}select a Y parameter")
+
+        GX = self.groups[gx_lbl]; GY = self.groups[gy_lbl]
+        if px not in GX.columns:
+            raise ValueError(f"{prefix}parameter '{px}' missing in X frame")
+        if py not in GY.columns:
+            raise ValueError(f"{prefix}parameter '{py}' missing in Y frame")
+
+        ds_x = None
+        try:
+            ds_x = self.group_meta.get(gx_lbl, (None, None, None))[0]
+        except Exception:
+            ds_x = None
+
+        xdf = GX[['event', px]].copy()
+        xdf['event'] = xdf['event'].astype(str).str.strip()
+        xdf[px] = pd.to_numeric(xdf[px], errors='coerce')
+        if 'dataset_id' in GX.columns:
+            xdf['dataset_id'] = GX['dataset_id'].astype(str)
+        else:
+            xdf['dataset_id'] = str(ds_x) if ds_x is not None else ''
+
+        ydf = GY[['event', py]].copy()
+        ydf['event'] = ydf['event'].astype(str).str.strip()
+        ydf[py] = pd.to_numeric(ydf[py], errors='coerce')
+
+        ctx_tag = context or 'primary'
+        ev_x = set(xdf['event'].dropna().astype(str))
+        ev_y = set(ydf['event'].dropna().astype(str))
+        inter = ev_x & ev_y
+        only_x = sorted(list(ev_x - ev_y))[:10]
+        only_y = sorted(list(ev_y - ev_x))[:10]
+        self.dprint(f"[events:{ctx_tag}] |X|={len(ev_x)} |Y|={len(ev_y)} |∩|={len(inter)}; sample only-in-X: {only_x}; only-in-Y: {only_y}")
+
+        merged = pd.merge(xdf, ydf, on='event', how='inner')
+        colx, coly = px, py
+        if px == py:
+            cx, cy = f"{px}_x", f"{py}_y"
+            if cx in merged.columns and cy in merged.columns:
+                colx, coly = cx, cy
+        mask = np.isfinite(merged[colx].values) & np.isfinite(merged[coly].values)
+        merged = merged.loc[mask]
+        if dropna:
+            merged = merged.dropna()
+        merged = merged.rename(columns={colx: 'X', coly: 'Y'})
+        keep_cols = ['X', 'Y', 'event', 'dataset_id']
+        for col in keep_cols:
+            if col not in merged.columns:
+                merged[col] = np.nan
+        merged = merged[keep_cols].reset_index(drop=True)
+        self.dprint(f"[prepare_xy] {context or 'primary'} => rows={len(merged)} from {gx_lbl}->{px} & {gy_lbl}->{py}")
+        return merged
+
     def update_plot(self):
         self.figure.clear()
         ax = self.figure.add_subplot(111)
         ax.set_facecolor('white')
         self.last_plot_df = None
+        self.last_overlay_df = None
         self._scatter = None
+        self._overlay_scatter = None
         self._sel_scatter = None
         self._current_display_X = None
         self._current_display_Y = None
@@ -635,51 +867,17 @@ class FitResultsVisualizer(QMainWindow):
             self.dprint("[update_plot] missing parameter selection")
             return
 
-        GX = self.groups[gx_lbl]
-        GY = self.groups[gy_lbl]
-        if px not in GX.columns or py not in GY.columns:
-            ax.set_title('Chosen parameter not present in selected frame(s)')
-            self.canvas.draw(); self._update_status("param missing")
-            self.dprint("[update_plot] param missing in group")
+        drop_na = self.chk_dropna.isChecked()
+        try:
+            merged = self._prepare_xy_dataframe(gx_lbl, px, gy_lbl, py, dropna=drop_na, context="primary")
+        except ValueError as exc:
+            msg = str(exc)
+            ax.set_title(msg)
+            self.canvas.draw(); self._update_status(msg)
+            self.dprint("[update_plot] primary prep failed:", msg)
             return
 
-        # Keep track of dataset_id for emitting selections; take from X frame
-        ds_x = None
-        try:
-            ds_x = self.group_meta.get(gx_lbl, (None, None, None))[0]
-        except Exception:
-            ds_x = None
-        xdf = GX[['event', px]].copy(); xdf['event'] = xdf['event'].astype(str).str.strip(); xdf[px] = pd.to_numeric(xdf[px], errors='coerce')
-        if 'dataset_id' in GX.columns:
-            xdf['dataset_id'] = GX['dataset_id'].astype(str)
-        else:
-            xdf['dataset_id'] = str(ds_x) if ds_x is not None else ''
-        ydf = GY[['event', py]].copy(); ydf['event'] = ydf['event'].astype(str).str.strip(); ydf[py] = pd.to_numeric(ydf[py], errors='coerce')
-
-        # Debug: event set overlap
-        ev_x = set(xdf['event'].dropna().astype(str))
-        ev_y = set(ydf['event'].dropna().astype(str))
-        inter = ev_x & ev_y
-        only_x = sorted(list(ev_x - ev_y))[:10]
-        only_y = sorted(list(ev_y - ev_x))[:10]
-        self.dprint(f"[events] |X|={len(ev_x)} |Y|={len(ev_y)} |∩|={len(inter)}; sample only-in-X: {only_x}; only-in-Y: {only_y}")
-
-        merged = pd.merge(xdf, ydf, on='event', how='inner')
-        # Handle case where px == py (merge creates suffixes _x, _y)
-        colx, coly = px, py
-        if px == py:
-            cx, cy = f"{px}_x", f"{py}_y"
-            if cx in merged.columns and cy in merged.columns:
-                colx, coly = cx, cy
-        # Filter finite values on the actual column names present
-        merged = merged[np.isfinite(merged[colx].values) & np.isfinite(merged[coly].values)]
-        if self.chk_dropna.isChecked():
-            merged = merged.dropna()
-        n_before = len(merged)
-        merged = merged.rename(columns={colx:'X', coly:'Y'})
-        self.dprint(f"[merge] {gx_lbl}({px}) ∩ {gy_lbl}({py}) => rows={n_before}")
-
-        # establish plot signature; clear selection/removals if context changed
+        # establish plot signature; clear selection/removals if context changed (primary only)
         sig = (self.ds_combo.currentText() if self.ds_combo.count() else 'All', gx_lbl, px, gy_lbl, py)
         if self._plot_sig != sig:
             self.selected_indices.clear()
@@ -692,20 +890,10 @@ class FitResultsVisualizer(QMainWindow):
             self.dprint("[update_plot] no overlap")
             return
 
-        (xmin,xmax), (ymin,ymax) = self._calc_limits(merged, 'X','Y')
-        try:
-            if self.chk_logx.isChecked():
-                if np.any(merged['X'] <= 0): self.dprint('[update_plot] WARNING: non-positive X with log scale')
-                ax.set_xscale('log')
-            if self.chk_logy.isChecked():
-                if np.any(merged['Y'] <= 0): self.dprint('[update_plot] WARNING: non-positive Y with log scale')
-                ax.set_yscale('log')
-        except Exception as e:
-            self.dprint('[update_plot] scale set failed:', e)
-
+        base_full = merged[['X','Y','event','dataset_id']].copy()
         try:
             # Base df and apply removals using base indices
-            base = merged[['X','Y','event','dataset_id']].reset_index(drop=True)
+            base = base_full.reset_index(drop=True)
             self._merged_base = base
             if self.removed_indices:
                 mask = ~base.index.to_series().isin(self.removed_indices)
@@ -717,29 +905,95 @@ class FitResultsVisualizer(QMainWindow):
 
             self._current_display_X = disp['X'].values
             self._current_display_Y = disp['Y'].values
-            self._scatter = ax.scatter(self._current_display_X, self._current_display_Y,
-                                       s=30, alpha=1.0, marker='o', edgecolors='none', zorder=3,
-                                       picker=True)
-
-            # selection overlay
-            self._update_selection_overlay(ax)
-
-            if np.isfinite(xmin) and np.isfinite(xmax): ax.set_xlim(xmin, xmax)
-            if np.isfinite(ymin) and np.isfinite(ymax): ax.set_ylim(ymin, ymax)
-            ax.grid(True, alpha=0.3)
-            ax.set_xlabel(f"{px}  [{gx_lbl}]")
-            ax.set_ylabel(f"{py}  [{gy_lbl}]")
-            ax.set_title(f"{py} vs {px}  (n={len(disp)})")
-            self.last_plot_df = disp[['X','Y']].copy()
-            if self._pick_cid is None:
-                self._pick_cid = self.canvas.mpl_connect('pick_event', self.on_pick)
-            self.canvas.draw(); self._update_status(f"plotted {len(disp)} pts")
-            self.dprint("[update_plot] plotted", len(disp), "points; xlim=", ax.get_xlim(), "ylim=", ax.get_ylim())
         except Exception as e:
             self.dprint("[update_plot] Exception during plotting:", e)
             traceback.print_exc()
             ax.set_title(f"Plot error: {e}")
             self.canvas.draw()
+            return
+
+        overlay_disp = None
+        overlay_label = None
+        overlay_err = None
+        if self.chk_overlay.isChecked():
+            ogx_lbl = self.gx2_combo.currentText()
+            ogy_lbl = self.gy2_combo.currentText()
+            opx = self.px2_combo.currentText()
+            opy = self.py2_combo.currentText()
+            try:
+                overlay_full = self._prepare_xy_dataframe(ogx_lbl, opx, ogy_lbl, opy, dropna=drop_na, context="overlay")
+            except ValueError as exc:
+                overlay_full = None
+                overlay_err = str(exc)
+                self.dprint("[overlay] skipped:", overlay_err)
+            if overlay_full is not None:
+                if overlay_full.empty:
+                    overlay_err = "overlay has no overlapping events"
+                else:
+                    overlay_disp = overlay_full[['X','Y']].reset_index(drop=True)
+                    self.last_overlay_df = overlay_disp[['X','Y']].copy()
+                    overlay_label = f"Overlay ({len(overlay_disp)} pts) {self._axes_group_label(ogx_lbl)} vs {self._axes_group_label(ogy_lbl)}"
+        else:
+            self.last_overlay_df = None
+
+        limit_source = base_full[['X','Y']]
+        if overlay_disp is not None and not overlay_disp.empty:
+            limit_source = pd.concat([limit_source, overlay_disp[['X','Y']]], ignore_index=True)
+
+        (xmin,xmax), (ymin,ymax) = self._calc_limits(limit_source, 'X','Y')
+        try:
+            if self.chk_logx.isChecked():
+                if np.any(limit_source['X'] <= 0): self.dprint('[update_plot] WARNING: non-positive X with log scale')
+                ax.set_xscale('log')
+            if self.chk_logy.isChecked():
+                if np.any(limit_source['Y'] <= 0): self.dprint('[update_plot] WARNING: non-positive Y with log scale')
+                ax.set_yscale('log')
+        except Exception as e:
+            self.dprint('[update_plot] scale set failed:', e)
+
+        primary_label = None
+        if overlay_disp is not None and not overlay_disp.empty:
+            primary_label = f"Primary ({len(disp)} pts)"
+        self._scatter = ax.scatter(self._current_display_X, self._current_display_Y,
+                                   s=30, alpha=1.0, marker='o', edgecolors='none', zorder=3,
+                                   picker=True, label=primary_label)
+
+        if overlay_disp is not None and not overlay_disp.empty:
+            self._overlay_scatter = ax.scatter(
+                overlay_disp['X'].values, overlay_disp['Y'].values,
+                s=36, marker='s', facecolors='none', edgecolors='tab:orange',
+                linewidths=1.0, alpha=0.85, zorder=4, label=overlay_label)
+        else:
+            self._overlay_scatter = None
+
+        # selection overlay
+        self._update_selection_overlay(ax)
+
+        if np.isfinite(xmin) and np.isfinite(xmax): ax.set_xlim(xmin, xmax)
+        if np.isfinite(ymin) and np.isfinite(ymax): ax.set_ylim(ymin, ymax)
+        ax.grid(True, alpha=0.3)
+        gx_axis_lbl = self._axes_group_label(gx_lbl)
+        gy_axis_lbl = self._axes_group_label(gy_lbl)
+        ax.set_xlabel(f"{px}  [{gx_axis_lbl}]")
+        ax.set_ylabel(f"{py}  [{gy_axis_lbl}]")
+        title = f"{py} vs {px}  (n={len(disp)})"
+        if overlay_disp is not None and not overlay_disp.empty:
+            title += f"  | overlay n={len(overlay_disp)}"
+        elif overlay_err:
+            title += f"  | overlay: {overlay_err}"
+        ax.set_title(title)
+        if (overlay_disp is not None and not overlay_disp.empty) or (primary_label is not None):
+            ax.legend()
+        self.last_plot_df = disp[['X','Y']].copy()
+        if self._pick_cid is None:
+            self._pick_cid = self.canvas.mpl_connect('pick_event', self.on_pick)
+        status_msg = f"plotted {len(disp)} pts"
+        if overlay_disp is not None and not overlay_disp.empty:
+            status_msg += f" | overlay {len(overlay_disp)} pts"
+        elif overlay_err:
+            status_msg += f" | overlay: {overlay_err}"
+        self.canvas.draw(); self._update_status(status_msg)
+        self.dprint("[update_plot] plotted", len(disp), "points; xlim=", ax.get_xlim(), "ylim=", ax.get_ylim())
 
     # ---------------- Point selection/removal -----------------
     def _update_selection_overlay(self, ax):
@@ -963,6 +1217,19 @@ class FitResultsVisualizer(QMainWindow):
                 parts.append("  sample only-in-X: " + ", ".join(map(str, only_x)))
             if only_y:
                 parts.append("  sample only-in-Y: " + ", ".join(map(str, only_y)))
+        if self.chk_overlay.isChecked():
+            ogx_lbl = self.gx2_combo.currentText(); ogy_lbl = self.gy2_combo.currentText()
+            opx = self.px2_combo.currentText(); opy = self.py2_combo.currentText()
+            parts.append(f"OVERLAY selection -> X:{ogx_lbl} [{opx}] | Y:{ogy_lbl} [{opy}]")
+            if ogx_lbl in self.groups and ogy_lbl in self.groups and opx and opy:
+                try:
+                    GX = self.groups[ogx_lbl][['event', opx]].copy(); GX['event'] = GX['event'].astype(str).str.strip(); GX[opx] = pd.to_numeric(GX[opx], errors='coerce')
+                    GY = self.groups[ogy_lbl][['event', opy]].copy(); GY['event'] = GY['event'].astype(str).str.strip(); GY[opy] = pd.to_numeric(GY[opy], errors='coerce')
+                    ev_x = set(GX['event'].dropna().astype(str)); ev_y = set(GY['event'].dropna().astype(str))
+                    inter = ev_x & ev_y
+                    parts.append(f"  overlay event overlap: |X|={len(ev_x)} |Y|={len(ev_y)} |∩|={len(inter)}")
+                except Exception as e:
+                    parts.append(f"  overlay preview failed: {e}")
         dlg_txt = "".join(parts)
         self.dprint("[diagnostics]" + dlg_txt)
         QMessageBox.information(self, "Diagnostics", dlg_txt)

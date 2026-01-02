@@ -1,8 +1,4 @@
-# Open Use License
-#
-# You may use, copy, modify, and redistribute this file for any purpose,
-# provided that redistributions include this original source code (including this notice).
-# This software is provided "as is" without warranty of any kind.
+# SPDX-License-Identifier: MIT
 
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import QDialog, QFormLayout, QDialogButtonBox, QDoubleSpinBox, QMessageBox

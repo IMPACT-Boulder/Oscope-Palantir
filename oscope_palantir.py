@@ -1,8 +1,4 @@
-# Open Use License
-#
-# You may use, copy, modify, and redistribute this file for any purpose,
-# provided that redistributions include this original source code (including this notice).
-# This software is provided "as is" without warranty of any kind.
+# SPDX-License-Identifier: MIT
 
 """
 Oscilloscope Palantir
@@ -13,6 +9,12 @@ Purpose:
     tool loads waveform events, allows interactive selection and fitting of
     pulses (QD3, QDM, CSA, etc.), applies Savitzky–Golay filtering, and exports
     figures or fit parameters for further study.
+
+	Future Update Ideas: 
+	- Add a config file for more user custom tweaks such as setting fit parameter 
+	tweaks, default directories, etc. . .
+	- Add a working file, save the current state to a file periodically to prevent
+	work loss.
 """
 
 import sys, os, re, csv, lmfit, matplotlib, threading

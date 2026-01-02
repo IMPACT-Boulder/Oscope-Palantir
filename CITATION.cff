@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+title: "Oscope Palantir"
+message: "If you use this software, please cite it."
+authors:
+  - family-names: Doner
+    given-names: Alex
+    affiliation: University of Colorado Boulder
+version: 1.0.0
+date-released: 2026-01-02
+url: https://github.com/IMPACT-Boulder/Oscope-Palantir
+license: MIT
+
