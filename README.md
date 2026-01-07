@@ -1,5 +1,7 @@
 # Oscilloscope Palantir
 
+DOI: https://doi.org/10.5281/zenodo.18177659
+
 > **Open Use License**  
 > You may use, copy, modify, and redistribute this repository for any purpose, provided that redistributions include this original source code (including this notice). This software is provided "as is" without warranty of any kind.
 
