@@ -6,7 +6,7 @@ DOI: https://doi.org/10.5281/zenodo.18177659
 > You may use, copy, modify, and redistribute this repository for any purpose, provided that redistributions include this original source code (including this notice). This software is provided "as is" without warranty of any kind.
 
 ## Overview
-Oscilloscope Palantir is a PyQt5 desktop application for reviewing multi-channel LeCroy `.trc` oscilloscope captures, selecting pulse regions, fitting physics-informed models, and exporting the results for downstream PVDF calibration studies. The 2025 builds emphasize fast iteration on large campaigns: every zoom, filter, or fit state is cached per dataset, and auxiliary tools (Results Plotter, feature scans, co-adds, etc.) can be launched without leaving the GUI.
+Oscilloscope Palantir is a PyQt5 desktop application for reviewing multi-channel LeCroy `.trc` oscilloscope captures, selecting pulse regions, fitting physics-informed models, and exporting the results for downstream studies. The 2025 builds emphasize fast iteration on large campaigns: every zoom, filter, or fit state is cached per dataset, and auxiliary tools (Results Plotter, feature scans, co-adds, etc.) can be launched without leaving the GUI.
 
 ## Key Capabilities (2025 release)
 - **Event-aware loader** – Point Palantir at a folder of `.trc` files and it auto-groups channels by event id, tags the dataset path, and preserves zoom/pan ranges on the channels you select as you step through events.
