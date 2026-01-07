@@ -36,12 +36,18 @@ try:
     from scipy.interpolate import interp1d
     if os.path.exists('q2v_5nf.csv'):
         df_5 = pd.read_csv('q2v_5nf.csv')
+        # q values were applied across 1 segment of a 10 segment detector; divide by 10 for CSA charge.
+        df_5['q'] = df_5['q'] / 10.0
         _q_of_v_5 = interp1d(df_5['v'].values, df_5['q'].values, kind='linear', fill_value='extrapolate')
     if os.path.exists('q2v_9-5nf.csv'):
         df_9 = pd.read_csv('q2v_9-5nf.csv')
+        # q values were applied across 1 segment of a 10 segment detector; divide by 10 for CSA charge.
+        df_9['q'] = df_9['q'] / 10.0
         _q_of_v_9 = interp1d(df_9['v'].values, df_9['q'].values, kind='linear', fill_value='extrapolate')
     if os.path.exists('q2v_15nf.csv'):
         df_15 = pd.read_csv('q2v_15nf.csv')
+        # q values were applied across 1 segment of a 10 segment detector; divide by 10 for CSA charge.
+        df_15['q'] = df_15['q'] / 10.0
         _q_of_v_15 = interp1d(df_15['v'].values, df_15['q'].values, kind='linear', fill_value='extrapolate')
 except Exception:
     pass
@@ -576,14 +582,20 @@ class FitResultsVisualizer(QMainWindow):
         return df
 
     def _maybe_add_qd_cal(self, df: pd.DataFrame) -> pd.DataFrame:
-        """For QD3Fit/QDMFit groups, add cal = mass^1.3 * v^3 if columns present."""
+        """For QD3Fit/QDMFit groups, add cal = mass_g^1.3 * v_km_s^3 if columns present."""
         if df.empty: return df
         if 'mass' not in df.columns or 'v' not in df.columns:
             return df
         try:
-            m = pd.to_numeric(df['mass'], errors='coerce')
-            v = pd.to_numeric(df['v'], errors='coerce')
-            cal = np.where(np.isfinite(m) & np.isfinite(v), np.power(m, 1.3) * np.power(v, 3.0), np.nan)
+            m_kg = pd.to_numeric(df['mass'], errors='coerce')
+            v_ms = pd.to_numeric(df['v'], errors='coerce')
+            m_g = m_kg * 1e3
+            v_kms = v_ms / 1e3
+            cal = np.where(
+                np.isfinite(m_g) & np.isfinite(v_kms),
+                np.power(m_g, 1.3) * np.power(v_kms, 3.0),
+                np.nan,
+            )
             df['cal'] = cal
         except Exception as e:
             self.dprint(f"[_maybe_add_qd_cal] failed: {e}")
@@ -764,6 +776,16 @@ class FitResultsVisualizer(QMainWindow):
         ch_str = str(ch) if ch is not None else ''
         return f"ds={ds_leaf} | {ft_str} | ch={ch_str}"
 
+    def _param_label(self, param: str) -> str:
+        if param == 'cal':
+            return "cal (g^1.3 * (km/s)^3)"
+        return param
+
+    def _param_tooltip(self, param: str) -> str:
+        if param == 'cal':
+            return "cal = m^1.3 * v^3 using mass in g and velocity in km/s"
+        return ""
+
     def _calc_limits(self, df: pd.DataFrame, x: str, y: str) -> Tuple[Tuple[float,float], Tuple[float,float]]:
         xmin, xmax = np.nanmin(df[x].values), np.nanmax(df[x].values)
         ymin, ymax = np.nanmin(df[y].values), np.nanmax(df[y].values)
@@ -856,6 +878,8 @@ class FitResultsVisualizer(QMainWindow):
 
         gx_lbl = self.gx_combo.currentText(); gy_lbl = self.gy_combo.currentText()
         px = self.px_combo.currentText(); py = self.py_combo.currentText()
+        opx = ''
+        opy = ''
         if not gx_lbl or not gy_lbl or gx_lbl not in self.groups or gy_lbl not in self.groups:
             ax.set_title('Load files and select X/Y frames')
             self.canvas.draw(); self._update_status("waiting for selection")
@@ -974,8 +998,16 @@ class FitResultsVisualizer(QMainWindow):
         ax.grid(True, alpha=0.3)
         gx_axis_lbl = self._axes_group_label(gx_lbl)
         gy_axis_lbl = self._axes_group_label(gy_lbl)
-        ax.set_xlabel(f"{px}  [{gx_axis_lbl}]")
-        ax.set_ylabel(f"{py}  [{gy_axis_lbl}]")
+        ax.set_xlabel(f"{self._param_label(px)}  [{gx_axis_lbl}]")
+        ax.set_ylabel(f"{self._param_label(py)}  [{gy_axis_lbl}]")
+        self.px_combo.setToolTip(self._param_tooltip(px))
+        self.py_combo.setToolTip(self._param_tooltip(py))
+        if self.chk_overlay.isChecked():
+            self.px2_combo.setToolTip(self._param_tooltip(opx))
+            self.py2_combo.setToolTip(self._param_tooltip(opy))
+        else:
+            self.px2_combo.setToolTip("")
+            self.py2_combo.setToolTip("")
         title = f"{py} vs {px}  (n={len(disp)})"
         if overlay_disp is not None and not overlay_disp.empty:
             title += f"  | overlay n={len(overlay_disp)}"
