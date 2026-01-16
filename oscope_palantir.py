@@ -65,9 +65,12 @@ FIT_LIB = {
     "gaussian": (gaussian, ["A", "mu", "sigma", "C"]),
     # Analysis-only utility: compute and plot FFT of selection in a popup
     "FFT": (None, []),
-    # Special measurement: Savitzky–Golay low-pass then take max (invert -> min)
-    "low_pass_max": (None, ["width", "baseline_slope", "baseline_intercept"])  # width = SG window samples (odd)
+    # Special measurement: Savitzky-Golay low-pass then take max (invert -> min)
+    "low_pass_max": (None, ["width", "baseline_slope", "baseline_intercept"]),  # width = SG window samples (odd)
+    # Special measurement: Savitzky-Golay low-pass then take peak - min (invert flips sign)
+    "low_pass_peak_min": (None, ["width", "baseline_slope", "baseline_intercept"]),
 }
+LOW_PASS_SPECIALS = {"low_pass_max", "low_pass_peak_min"}
 
 # Consistent styling for traces, filters, and fits
 RAW_TRACE_COLOR   = "C0"          # keep default blue for raw data
@@ -81,6 +84,7 @@ FIT_COLOR_PRESETS = {
     "skew_gaussian": "#00897b",  # teal
     "gaussian": "#f4511e",       # warm red-orange
     "low_pass_max": "#ef5350",   # red marker
+    "low_pass_peak_min": "#26a69a",  # teal marker
 }
 FIT_COLOR_FALLBACK = [
     "#5e35b1", "#29b6f6", "#7cb342", "#6d4c41",
@@ -499,7 +503,17 @@ class SciFitParamsDialog(QDialog):
 
 class BatchFitDialog(QDialog):
     """Collects event range, time window, and threading options for batch fitting."""
-    def __init__(self, parent, evt_min, evt_max, tmin=None, tmax=None, default_threads=1, max_threads=None):
+    def __init__(
+        self,
+        parent,
+        evt_min,
+        evt_max,
+        tmin=None,
+        tmax=None,
+        default_threads=1,
+        max_threads=None,
+        func_default=None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Batch Fit Configuration")
         layout = QVBoxLayout(self)
@@ -518,18 +532,52 @@ class BatchFitDialog(QDialog):
         self.end_evt.setToolTip("Last event number to include")
         grid.addWidget(self.end_evt, 1, 1)
 
+        # Fit function
+        grid.addWidget(QLabel("Fit Function"), 2, 0)
+        self.func_combo = QComboBox()
+        self.func_combo.addItems(sorted(FIT_LIB.keys()))
+        if func_default in FIT_LIB:
+            self.func_combo.setCurrentText(str(func_default))
+        grid.addWidget(self.func_combo, 2, 1)
+
         # Time window inputs (seconds)
-        grid.addWidget(QLabel("Time Start [s]"), 2, 0)
+        grid.addWidget(QLabel("Time Start [s]"), 3, 0)
         self.t_start = QLineEdit("" if tmin is None else f"{float(tmin):.9f}")
         self.t_start.setToolTip("Lower bound of fit window in seconds")
-        grid.addWidget(self.t_start, 2, 1)
+        grid.addWidget(self.t_start, 3, 1)
 
-        grid.addWidget(QLabel("Time End [s]"), 3, 0)
+        grid.addWidget(QLabel("Time End [s]"), 4, 0)
         self.t_end = QLineEdit("" if tmax is None else f"{float(tmax):.9f}")
         self.t_end.setToolTip("Upper bound of fit window in seconds")
-        grid.addWidget(self.t_end, 3, 1)
+        grid.addWidget(self.t_end, 4, 1)
 
-        grid.addWidget(QLabel("Worker Threads"), 4, 0)
+        # Impact-centered window options
+        self.impact_chk = QCheckBox("Center window on impact time (QD3/QDM)")
+        self.impact_chk.setToolTip("Use t0 + distance/velocity as the window center per event")
+        layout.addWidget(self.impact_chk)
+
+        impact_grid = QGridLayout()
+        layout.addLayout(impact_grid)
+        impact_grid.addWidget(QLabel("Impact window width [s]"), 0, 0)
+        self.impact_width = QDoubleSpinBox()
+        self.impact_width.setDecimals(9)
+        self.impact_width.setRange(0.0, 1e9)
+        self.impact_width.setSingleStep(1e-6)
+        width_default = 0.0
+        if tmin is not None and tmax is not None:
+            try:
+                width_default = max(0.0, float(tmax) - float(tmin))
+            except Exception:
+                width_default = 0.0
+        self.impact_width.setValue(width_default)
+        impact_grid.addWidget(self.impact_width, 0, 1)
+
+        impact_grid.addWidget(QLabel("Impact source"), 1, 0)
+        self.impact_source = QComboBox()
+        self.impact_source.addItems(["Auto (prefer QD3)", "QD3Fit", "QDMFit"])
+        impact_grid.addWidget(self.impact_source, 1, 1)
+
+        grid.addWidget(QLabel("Worker Threads"), 5, 0)
         self.thread_spin = QSpinBox()
         max_threads = max_threads or max(1, os.cpu_count() or 1)
         self.thread_spin.setRange(1, max_threads)
@@ -540,10 +588,19 @@ class BatchFitDialog(QDialog):
         default_threads = max(1, min(default_threads, max_threads))
         self.thread_spin.setValue(default_threads)
         self.thread_spin.setToolTip("Number of parallel worker threads to use during batch fitting")
-        grid.addWidget(self.thread_spin, 4, 1)
+        grid.addWidget(self.thread_spin, 5, 1)
 
-        note = QLabel("Uses the currently selected Fit + Channel + Invert.")
+        note = QLabel("Uses the selected Fit Function plus the current Channel + Invert.")
         layout.addWidget(note)
+
+        def _toggle_impact(enabled):
+            self.t_start.setEnabled(not enabled)
+            self.t_end.setEnabled(not enabled)
+            self.impact_width.setEnabled(enabled)
+            self.impact_source.setEnabled(enabled)
+
+        self.impact_chk.toggled.connect(_toggle_impact)
+        _toggle_impact(self.impact_chk.isChecked())
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
         btns.accepted.connect(self.accept)
@@ -556,17 +613,24 @@ class BatchFitDialog(QDialog):
             ev1 = int(self.end_evt.text().strip())
         except Exception:
             raise ValueError("Invalid event range")
-        try:
-            t0 = float(self.t_start.text().strip())
-            t1 = float(self.t_end.text().strip())
-        except Exception:
-            raise ValueError("Invalid time window")
-        if t1 <= t0:
-            raise ValueError("Time End must be > Time Start")
+        use_impact = bool(self.impact_chk.isChecked())
+        t0 = None
+        t1 = None
+        if not use_impact:
+            try:
+                t0 = float(self.t_start.text().strip())
+                t1 = float(self.t_end.text().strip())
+            except Exception:
+                raise ValueError("Invalid time window")
+            if t1 <= t0:
+                raise ValueError("Time End must be > Time Start")
         if ev1 < ev0:
             raise ValueError("End Event must be >= Start Event")
         threads = int(self.thread_spin.value())
-        return ev0, ev1, t0, t1, threads
+        impact_width = float(self.impact_width.value())
+        impact_source = str(self.impact_source.currentText())
+        func_name = str(self.func_combo.currentText())
+        return ev0, ev1, t0, t1, threads, func_name, use_impact, impact_width, impact_source
 
 class SGBatchDialog(QDialog):
     """Configuration dialog for running SG filtering across multiple events."""
@@ -695,7 +759,7 @@ class WaveformCoaddDialog(QDialog):
 
 class FeatureScanDialog(QDialog):
     """Collects event range, channel, and threshold for feature scanning."""
-    def __init__(self, parent, evt_min, evt_max, ch_default=1, thr_default=5.0):
+    def __init__(self, parent, evt_min, evt_max, ch_default=1, thr_default=5.0, smooth_default=0):
         super().__init__(parent)
         self.setWindowTitle("Feature Scan Configuration")
         layout = QVBoxLayout(self)
@@ -725,9 +789,20 @@ class FeatureScanDialog(QDialog):
         self.thr_spin.setValue(float(thr_default))
         grid.addWidget(self.thr_spin, 3, 1)
 
+        grid.addWidget(QLabel("Smooth window (samples, odd; 0=auto)"), 4, 0)
+        self.smooth_spin = QSpinBox()
+        self.smooth_spin.setRange(0, 9999)
+        self.smooth_spin.setSingleStep(2)
+        self.smooth_spin.setValue(int(smooth_default))
+        grid.addWidget(self.smooth_spin, 4, 1)
+
         self.abs_chk = QCheckBox("Use absolute value")
         self.abs_chk.setChecked(True)
         layout.addWidget(self.abs_chk)
+
+        self.detrend_chk = QCheckBox("Detrend before scan")
+        self.detrend_chk.setChecked(False)
+        layout.addWidget(self.detrend_chk)
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
         btns.accepted.connect(self.accept)
@@ -744,8 +819,10 @@ class FeatureScanDialog(QDialog):
             raise ValueError("End Event must be >= Start Event")
         ch = int(self.ch_combo.currentText())
         thr = float(self.thr_spin.value())
+        smooth = int(self.smooth_spin.value())
         use_abs = bool(self.abs_chk.isChecked())
-        return ev0, ev1, ch, thr, use_abs
+        use_detrend = bool(self.detrend_chk.isChecked())
+        return ev0, ev1, ch, thr, smooth, use_abs, use_detrend
 
 
 class FeatureResultsDialog(QDialog):
@@ -1381,7 +1458,7 @@ class OscilloscopeAnalyzer(QMainWindow):
 
         self.dyn_func_combo = QComboBox()
         self.dyn_func_combo.addItems(sorted(FIT_LIB.keys()))
-        self.dyn_func_combo.setToolTip("Q=QD3Fit, D=QDMFit, C=CSA_pulse, W=skew_gaussian, G=gaussian, Shift+F=FFT, X=low_pass_max")
+        self.dyn_func_combo.setToolTip("Q=QD3Fit, D=QDMFit, C=CSA_pulse, W=skew_gaussian, G=gaussian, Shift+F=FFT, X=low_pass_max, Z=low_pass_peak_min")
         self.dyn_func_combo.setFixedWidth(self.unit_width+2)
         self.dyn_func_combo.setMaximumHeight(btn_height)
         ctrl_layout5.addWidget(self.dyn_func_combo)
@@ -1447,7 +1524,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         # Batch run across multiple events for the selected fit/channel
         self.btn_batch_dyn = QPushButton("Batch Run")
         self.btn_batch_dyn.setIcon(qta.icon('fa5s.play', color=self.accent))
-        self.btn_batch_dyn.setToolTip("Run selected fit over a time window across a range of events (B)")
+        self.btn_batch_dyn.setToolTip("Run selected fit over a time window or impact-centered window across events (B)")
         self.btn_batch_dyn.clicked.connect(self.run_batch_fit)
         self.btn_batch_dyn.setFixedWidth(self.unit_width)
         self.btn_batch_dyn.setMaximumHeight(btn_height)
@@ -1897,6 +1974,9 @@ class OscilloscopeAnalyzer(QMainWindow):
         elif key == Qt.Key_X:
             if hasattr(self, 'dyn_func_combo') and self.dyn_func_combo.isEnabled():
                 self.dyn_func_combo.setCurrentText("low_pass_max")
+        elif key == Qt.Key_Z:
+            if hasattr(self, 'dyn_func_combo') and self.dyn_func_combo.isEnabled():
+                self.dyn_func_combo.setCurrentText("low_pass_peak_min")
         # Channel numeric keys
         elif key in (Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4, Qt.Key_5, Qt.Key_6, Qt.Key_7, Qt.Key_8):
             desired = str(key - Qt.Key_0)
@@ -1971,6 +2051,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         add_shortcut(Qt.Key_W, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("skew_gaussian")))
         add_shortcut(Qt.Key_G, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("gaussian")))
         add_shortcut(Qt.Key_X, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("low_pass_max")))
+        add_shortcut(Qt.Key_Z, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("low_pass_peak_min")))
         # Shift+F selects FFT without overriding plain F (Select Folder)
         add_shortcut(Qt.SHIFT + Qt.Key_F, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("FFT")))
 
@@ -2713,6 +2794,63 @@ class OscilloscopeAnalyzer(QMainWindow):
                 preview += f"\n... ({len(errors) - 5} more)"
             QMessageBox.warning(self, "Batch Errors", f"Some events could not be processed:\n{preview}")
 
+    def _fit_baseline_line(self, t_vals, y_vals, clip_sigma=3.0, max_iter=4):
+        """Robust linear baseline fit using iterative sigma-clipping."""
+        t = np.asarray(t_vals, dtype=np.float64)
+        y = np.asarray(y_vals, dtype=np.float64)
+        finite = np.isfinite(t) & np.isfinite(y)
+        if not np.all(finite):
+            t = t[finite]
+            y = y[finite]
+        n = t.size
+        if n < 2:
+            intercept = float(np.mean(y)) if n else 0.0
+            return 0.0, intercept
+
+        def _safe_polyfit(t_fit, y_fit):
+            if t_fit.size < 2:
+                intercept = float(np.mean(y_fit)) if y_fit.size else 0.0
+                return 0.0, intercept, False
+            try:
+                coeffs = np.polyfit(t_fit, y_fit, 1)
+                return float(coeffs[0]), float(coeffs[1]), True
+            except Exception:
+                intercept = float(np.mean(y_fit)) if y_fit.size else 0.0
+                return 0.0, intercept, False
+
+        slope, intercept, _ = _safe_polyfit(t, y)
+        if n < 5:
+            return slope, intercept
+
+        min_points = max(5, int(np.ceil(0.02 * n)))
+        mask = np.ones(n, dtype=bool)
+        for _ in range(max_iter):
+            resid = y - (slope * t + intercept)
+            resid_in = resid[mask]
+            if resid_in.size < min_points:
+                break
+            mad = np.median(np.abs(resid_in))
+            scale = 1.4826 * mad
+            if scale <= 1e-12:
+                break
+            new_mask = np.abs(resid) <= clip_sigma * scale
+            if new_mask.sum() < min_points:
+                break
+            if np.array_equal(new_mask, mask):
+                break
+            mask = new_mask
+            slope, intercept, _ = _safe_polyfit(t[mask], y[mask])
+
+        if mask.sum() < min_points:
+            tail_n = max(2, int(np.ceil(0.2 * n)))
+            if tail_n * 2 > n:
+                tail_n = max(2, n // 2)
+            idx = np.arange(n)
+            tail_mask = (idx < tail_n) | (idx >= n - tail_n)
+            slope, intercept, _ = _safe_polyfit(t[tail_mask], y[tail_mask])
+
+        return slope, intercept
+
     def _guess_params(self, func_name, names, t_sel, y_sel):
         """Return initial parameter guesses and bounds for curve_fit."""
         guess = {}
@@ -2947,7 +3085,7 @@ class OscilloscopeAnalyzer(QMainWindow):
 
         invert_flag = self.dyn_invert.isChecked()
         y_base = y_sel
-        y_for_fit = -y_base if (invert_flag and func_name != "low_pass_max") else y_base
+        y_for_fit = -y_base if (invert_flag and func_name not in LOW_PASS_SPECIALS) else y_base
 
         # Optional decimation prior to fitting/measurements
         decim_factor = 1
@@ -2965,7 +3103,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             y_fit = y_for_fit
             y_base_fit = y_base
         min_required = len(names) + 2
-        if func_name == "low_pass_max":
+        if func_name in LOW_PASS_SPECIALS:
             min_required = max(min_required, 5)
         if decim_factor > 1 and t_fit.size < min_required and t_sel.size >= min_required:
             # Fall back to full data if decimation left too few samples
@@ -2977,7 +3115,8 @@ class OscilloscopeAnalyzer(QMainWindow):
             return
 
         # Special-case measurement that doesn't use curve_fit
-        if func_name == "low_pass_max":
+        if func_name in LOW_PASS_SPECIALS:
+            use_peak_min = func_name == "low_pass_peak_min"
             # Default width from SG control if present, else 201
             w = int(self.sg_win.value()) if hasattr(self, 'sg_win') else 201
             # If an existing result for this region exists, reuse its width (suppress warnings here)
@@ -2998,20 +3137,8 @@ class OscilloscopeAnalyzer(QMainWindow):
             w = max(5, w)
             # Prepare data (apply invert for picking minima) and remove baseline trend.
             y_proc = -y_base_fit if invert_flag else y_base_fit
-            # Fit a first-order baseline using the leading 20% of the window to avoid pulse bias.
-            baseline_slope = 0.0
-            lead_count = max(2, int(np.ceil(0.2 * len(t_fit))))
-            t_base = t_fit[:lead_count]
-            y_base = y_base_fit[:lead_count]
-            baseline_intercept = float(np.mean(y_base)) if y_base.size else (float(np.mean(y_base_fit)) if y_base_fit.size else 0.0)
-            if t_base.size >= 2:
-                try:
-                    coeffs = np.polyfit(t_base, y_base, 1)
-                    baseline_slope = float(coeffs[0])
-                    baseline_intercept = float(coeffs[1])
-                except Exception:
-                    baseline_slope = 0.0
-                    baseline_intercept = float(np.mean(y_base)) if y_base.size else (float(np.mean(y_base_fit)) if y_base_fit.size else 0.0)
+            # Fit a robust first-order baseline across the selection (sigma-clipped).
+            baseline_slope, baseline_intercept = self._fit_baseline_line(t_fit, y_base_fit)
             baseline_vals = baseline_slope * t_fit + baseline_intercept
             baseline_proc = -baseline_vals if invert_flag else baseline_vals
             y_corr = y_proc - baseline_proc
@@ -3027,8 +3154,24 @@ class OscilloscopeAnalyzer(QMainWindow):
                 QMessageBox.warning(self, "No Data", "Selection too small for SG filter.")
                 return
             val_corr = -val_corr_proc if invert_flag else val_corr_proc
+            t_min = None
+            value_raw_min = None
+            if use_peak_min:
+                idx_min = int(np.argmin(y_f)) if y_f.size else 0
+                t_min = float(t_fit[idx_min]) if len(t_fit) else None
+                val_min_proc = float(y_f[idx_min]) if y_f.size else None
+                if t_min is None or val_min_proc is None:
+                    QMessageBox.warning(self, "No Data", "Selection too small for SG filter.")
+                    return
+                val_min = -val_min_proc if invert_flag else val_min_proc
+                value = val_corr - val_min
+            else:
+                value = val_corr
             baseline_peak = float(baseline_slope * t_fit[idx] + baseline_intercept)
             value_raw = baseline_peak + val_corr
+            if use_peak_min:
+                baseline_min = float(baseline_slope * t_fit[idx_min] + baseline_intercept)
+                value_raw_min = baseline_min + val_min
             # Plot marker on original polarity
             ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
             # Remove prior marker if any for this selection
@@ -3046,6 +3189,12 @@ class OscilloscopeAnalyzer(QMainWindow):
                              color=color, markeredgecolor=color, markerfacecolor=color,
                              markersize=6, label=label, zorder=4)
             line.set_gid(key)
+            min_line = None
+            if use_peak_min and t_min is not None and value_raw_min is not None:
+                min_line, = ax.plot([t_min], [value_raw_min], marker='o', linestyle='None',
+                                    color=color, markeredgecolor=color, markerfacecolor='none',
+                                    markersize=5, label="_nolegend_", zorder=4)
+                min_line.set_gid(key)
             if region is not None:
                 ax.axvline(region[0], color="red", linestyle="--", alpha=0.7)
                 ax.axvline(region[1], color="red", linestyle="--", alpha=0.7)
@@ -3057,11 +3206,12 @@ class OscilloscopeAnalyzer(QMainWindow):
                 "fit_region": region if region is not None else (float(t_sel[0]), float(t_sel[-1])),
                 "dataset_id": self.dataset_id,
                 "inverted": invert_flag,
-                "value": float(val_corr),
+                "value": float(value),
                 "value_raw": float(value_raw),
                 "baseline": float(baseline_peak),
                 "t_at": float(t_peak),
                 "line": line,
+                "min_line": min_line,
             }
             self.fit_info_window.update_info(self.results, self.event_combo.currentText())
             return
@@ -3403,14 +3553,25 @@ class OscilloscopeAnalyzer(QMainWindow):
             tmax_def,
             default_threads=default_threads,
             max_threads=max_threads,
+            func_default=func_name,
         )
         if dlg.exec_() != QDialog.Accepted:
             return
 
         try:
-            ev0, ev1, t0_win, t1_win, thread_count = dlg.values()
+            ev0, ev1, t0_win, t1_win, thread_count, func_name, use_impact, impact_width, impact_source = dlg.values()
         except Exception as e:
             QMessageBox.warning(self, "Invalid Input", str(e))
+            return
+
+        if func_name not in FIT_LIB:
+            QMessageBox.warning(self, "No Fit Selected", "Choose a valid fit function.")
+            return
+        if func_name == "FFT":
+            QMessageBox.warning(self, "Invalid Fit", "FFT cannot be run in batch mode.")
+            return
+        if use_impact and impact_width <= 0:
+            QMessageBox.warning(self, "Invalid Window", "Impact window width must be > 0.")
             return
 
         thread_count = max(1, int(thread_count))
@@ -3420,6 +3581,70 @@ class OscilloscopeAnalyzer(QMainWindow):
         if not target_events:
             QMessageBox.information(self, "No Events", "No events in the specified range.")
             return
+
+        impact_times = None
+        if use_impact:
+            target_set = set(target_events)
+            fit_pattern = re.compile(r"^evt_(.+?)_(QD3Fit|QDMFit)_ch")
+            fits_by_event = {}
+            for k, rec in self.results.items():
+                m = fit_pattern.match(k)
+                if not m:
+                    continue
+                evt_key, fit_type = m.group(1), m.group(2)
+                if evt_key not in target_set:
+                    continue
+                if rec.get('dataset_id') is not None and rec.get('dataset_id') != self.dataset_id:
+                    continue
+                fits_by_event.setdefault(evt_key, {}).setdefault(fit_type, []).append((k, rec))
+
+            impact_mode = str(impact_source)
+            if impact_mode.startswith("Auto"):
+                impact_mode = "auto"
+
+            def _pick_fit(evt_key):
+                fits = fits_by_event.get(evt_key, {})
+                if impact_mode == "QD3Fit":
+                    candidates = fits.get("QD3Fit", [])
+                elif impact_mode == "QDMFit":
+                    candidates = fits.get("QDMFit", [])
+                else:
+                    candidates = fits.get("QD3Fit") or fits.get("QDMFit") or []
+                if not candidates:
+                    return None
+                candidates = sorted(candidates, key=lambda item: item[0])
+                return candidates[0][1]
+
+            impact_times = {}
+            d = float(self.dist_spin.value())
+            for evt_key in target_events:
+                rec = _pick_fit(evt_key)
+                if rec is None:
+                    continue
+                t_imp = rec.get('impact_time')
+                if t_imp is None:
+                    params = rec.get('params', ())
+                    if len(params) >= 3:
+                        try:
+                            t0 = float(params[0])
+                            v = float(params[2])
+                        except Exception:
+                            t0 = None
+                            v = None
+                        if t0 is not None and v not in (None, 0.0):
+                            t_imp = t0 + d / v
+                if t_imp is None:
+                    continue
+                impact_times[evt_key] = float(t_imp)
+
+            target_events = [evt for evt in target_events if evt in impact_times]
+            if not target_events:
+                QMessageBox.information(
+                    self,
+                    "No Events",
+                    "No events with QD3/QDM fits and valid impact times were found in the range.",
+                )
+                return
 
         func, names = FIT_LIB[func_name]
 
@@ -3431,6 +3656,7 @@ class OscilloscopeAnalyzer(QMainWindow):
                 decim_factor = 1
 
         default_sg_window = int(self.sg_win.value()) if hasattr(self, "sg_win") else 201
+        use_sg_data = bool(getattr(self, "use_sg_toggle", None) and self.use_sg_toggle.isChecked())
 
         dataset_id = self.dataset_id
         current_event = self.event_combo.currentText()
@@ -3462,24 +3688,47 @@ class OscilloscopeAnalyzer(QMainWindow):
             if ch_path is None:
                 return {"status": "skip", "event": evt_key}
 
-            try:
-                trc_reader = Trc()
-                t, y, _ = trc_reader.open(ch_path)
+            sg_payload = None
+            if use_sg_data:
+                sg_payload = self._load_sg_cache(evt_key, ch, default_sg_window)
+                if sg_payload is None and evt_key == current_event:
+                    if self.sg_filtered_meta.get(ch) == default_sg_window:
+                        sg_payload = self.sg_filtered.get(ch)
+
+            if sg_payload is not None:
+                t, y = sg_payload
                 t = np.asarray(t, dtype=np.float64)
                 y = np.asarray(y, dtype=np.float64)
-            except Exception as err:
-                return {"status": "error", "event": evt_key, "error": err}
+            else:
+                try:
+                    trc_reader = Trc()
+                    t, y, _ = trc_reader.open(ch_path)
+                    t = np.asarray(t, dtype=np.float64)
+                    y = np.asarray(y, dtype=np.float64)
+                except Exception as err:
+                    return {"status": "error", "event": evt_key, "error": err}
 
             if cancel_event.is_set():
                 return {"status": "cancelled", "event": evt_key}
 
-            mask = (t >= t0_win) & (t <= t1_win)
+            if use_impact:
+                t_center = impact_times.get(evt_key)
+                if t_center is None:
+                    return {"status": "skip", "event": evt_key}
+                half = 0.5 * impact_width
+                t0_evt = t_center - half
+                t1_evt = t_center + half
+            else:
+                t0_evt = t0_win
+                t1_evt = t1_win
+
+            mask = (t >= t0_evt) & (t <= t1_evt)
             t_sel_full = t[mask]
             y_sel_full = y[mask]
             if t_sel_full.size < window_min_samples:
                 return {"status": "skip", "event": evt_key}
 
-            y_fit_full = -y_sel_full if (invert_flag and func_name != "low_pass_max") else y_sel_full
+            y_fit_full = -y_sel_full if (invert_flag and func_name not in LOW_PASS_SPECIALS) else y_sel_full
 
             if decim_factor > 1:
                 t_fit = t_sel_full[::decim_factor]
@@ -3490,7 +3739,7 @@ class OscilloscopeAnalyzer(QMainWindow):
                 y_fit = y_fit_full
                 y_base_fit = y_sel_full
 
-            if func_name == "low_pass_max":
+            if func_name in LOW_PASS_SPECIALS:
                 min_required = max(len(names) + 2, 5)
             else:
                 min_required = len(names) + 2
@@ -3503,7 +3752,8 @@ class OscilloscopeAnalyzer(QMainWindow):
             if t_fit.size < min_required:
                 return {"status": "skip", "event": evt_key}
 
-            if func_name == "low_pass_max":
+            if func_name in LOW_PASS_SPECIALS:
+                use_peak_min = func_name == "low_pass_peak_min"
                 w = default_sg_window
                 if w % 2 == 0:
                     w += 1
@@ -3518,20 +3768,35 @@ class OscilloscopeAnalyzer(QMainWindow):
                     val_proc = float(y_filtered[idx]) if y_filtered.size else None
                     if t_peak is None or val_proc is None:
                         return {"status": "skip", "event": evt_key}
-                    val = -val_proc if invert_flag else val_proc
+                    val_peak = -val_proc if invert_flag else val_proc
+                    t_min = None
+                    val_min = None
+                    if use_peak_min:
+                        idx_min = int(np.argmin(y_filtered)) if y_filtered.size else 0
+                        t_min = float(t_fit[idx_min]) if t_fit.size else None
+                        val_min_proc = float(y_filtered[idx_min]) if y_filtered.size else None
+                        if t_min is None or val_min_proc is None:
+                            return {"status": "skip", "event": evt_key}
+                        val_min = -val_min_proc if invert_flag else val_min_proc
+                        value = val_peak - val_min
+                    else:
+                        value = val_peak
                 except Exception as err:
                     return {"status": "error", "event": evt_key, "error": err}
 
                 payload = {
                     "status": "ok",
-                    "type": "low_pass_max",
+                    "type": func_name,
                     "event": evt_key,
                     "width": int(w),
-                    "value": float(val),
+                    "value": float(value),
                     "t_peak": float(t_peak),
+                    "fit_region": (float(t0_evt), float(t1_evt)),
                 }
                 if can_plot_current and evt_key == current_event:
-                    payload["plot_point"] = (float(t_peak), float(val))
+                    payload["plot_point"] = (float(t_peak), float(val_peak))
+                    if use_peak_min and t_min is not None and val_min is not None:
+                        payload["plot_min_point"] = (float(t_min), float(val_min))
                 return payload
 
             try:
@@ -3553,6 +3818,7 @@ class OscilloscopeAnalyzer(QMainWindow):
                 "type": "fit",
                 "event": evt_key,
                 "params": tuple(float(v) for v in popt),
+                "fit_region": (float(t0_evt), float(t1_evt)),
             }
             if errors is not None:
                 payload["errors"] = tuple(float(e) if np.isfinite(e) else np.nan for e in errors)
@@ -3597,13 +3863,16 @@ class OscilloscopeAnalyzer(QMainWindow):
                     idx += 1
                     key = f"{base}_{idx}"
 
+                fit_region = result.get("fit_region")
+                if fit_region is None and t0_win is not None and t1_win is not None:
+                    fit_region = (float(t0_win), float(t1_win))
                 rec = {
-                    "fit_region": (float(t0_win), float(t1_win)),
+                    "fit_region": fit_region,
                     "dataset_id": dataset_id,
                     "inverted": invert_flag,
                 }
 
-                if result["type"] == "low_pass_max":
+                if result["type"] in LOW_PASS_SPECIALS:
                     rec.update({
                         "params": (int(result["width"]),),
                         "param_names": ["width"],
@@ -3629,6 +3898,24 @@ class OscilloscopeAnalyzer(QMainWindow):
                         )
                         line.set_gid(key)
                         rec["line"] = line
+                        min_line = None
+                        if result.get("plot_min_point") is not None:
+                            t_min, val_min = result["plot_min_point"]
+                            min_line, = ax.plot(
+                                [t_min],
+                                [val_min],
+                                marker="o",
+                                linestyle="None",
+                                color=color,
+                                markeredgecolor=color,
+                                markerfacecolor="none",
+                                markersize=5,
+                                label="_nolegend_",
+                                zorder=4,
+                            )
+                            min_line.set_gid(key)
+                        if min_line is not None:
+                            rec["min_line"] = min_line
                         ax.legend()
                         any_plot_updates = True
                 else:
@@ -3654,7 +3941,7 @@ class OscilloscopeAnalyzer(QMainWindow):
                         if t_plot is not None and t_plot.size:
                             ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
                             y_model = func(t_plot, *params)
-                            if invert_flag and func_name != "low_pass_max":
+                            if invert_flag and func_name not in LOW_PASS_SPECIALS:
                                 y_model = -y_model
                             label = f"{func_name} Fit {idx}" if idx > 1 else f"{func_name} Fit"
                             color = self._resolve_fit_color(func_name)
@@ -3817,8 +4104,9 @@ class OscilloscopeAnalyzer(QMainWindow):
         if key is None:
             return
         rec = self.results[key]
-        # Special-case: low_pass_max parameter adjustment
-        if func_name == "low_pass_max":
+        # Special-case: low-pass extrema parameter adjustment
+        if func_name in LOW_PASS_SPECIALS:
+            use_peak_min = func_name == "low_pass_peak_min"
             params = tuple(rec.get("params", ()))
             names = list(rec.get("param_names", ()))
             param_map = {n: params[i] for i, n in enumerate(names) if i < len(params)}
@@ -3880,7 +4168,8 @@ class OscilloscopeAnalyzer(QMainWindow):
                     cur_intercept = float(np.mean(y_base)) if y_base.size else (float(np.mean(y_sel)) if y_sel.size else 0.0)
 
             dlg = QDialog(self)
-            dlg.setWindowTitle("Low-pass Max Settings")
+            title = "Low-pass Peak-Min Settings" if use_peak_min else "Low-pass Max Settings"
+            dlg.setWindowTitle(title)
             lay = QVBoxLayout(dlg)
 
             width_row = QHBoxLayout()
@@ -3946,14 +4235,13 @@ class OscilloscopeAnalyzer(QMainWindow):
             fig.tight_layout()
 
             def _auto_baseline():
-                lead_n = max(2, int(np.ceil(0.2 * len(t_sel))))
-                if lead_n < 2:
+                if t_sel.size < 2:
                     status_label.setText("Need a larger selection to refit baseline.")
                     return
                 try:
-                    coeffs = np.polyfit(t_sel[:lead_n], y_sel[:lead_n], 1)
-                    slope_spin.setValue(float(coeffs[0]))
-                    intercept_spin.setValue(float(coeffs[1]))
+                    slope_val, intercept_val = self._fit_baseline_line(t_sel, y_sel)
+                    slope_spin.setValue(float(slope_val))
+                    intercept_spin.setValue(float(intercept_val))
                     status_label.setText("")
                 except Exception as err:
                     status_label.setText(f"Baseline refit failed: {err}")
@@ -4024,8 +4312,21 @@ class OscilloscopeAnalyzer(QMainWindow):
                     return False
                 val_corr_proc = float(y_f[idx])
                 val_corr = -val_corr_proc if invert_flag else val_corr_proc
+                t_min = None
+                value_raw_min = None
+                if use_peak_min:
+                    idx_min = int(np.argmin(y_f))
+                    t_min = float(t_sel[idx_min])
+                    val_min_proc = float(y_f[idx_min])
+                    val_min = -val_min_proc if invert_flag else val_min_proc
+                    value = val_corr - val_min
+                else:
+                    value = val_corr
                 baseline_peak = float(slope_val * t_sel[idx] + intercept_val)
                 value_raw = baseline_peak + val_corr
+                if use_peak_min:
+                    baseline_min = float(slope_val * t_sel[idx_min] + intercept_val)
+                    value_raw_min = baseline_min + val_min
                 filtered_world = baseline_vals + (-y_f if invert_flag else y_f)
 
                 ax_prev.cla()
@@ -4034,6 +4335,9 @@ class OscilloscopeAnalyzer(QMainWindow):
                 ax_prev.plot(t_sel, filtered_world, label="Filtered", color="#2e7d32", linewidth=1.0)
                 ax_prev.axvline(t_peak, color="#d81b60", linestyle=":", linewidth=1.0)
                 ax_prev.plot([t_peak], [value_raw], marker='o', color="#d81b60", markersize=6, label="Peak")
+                if use_peak_min and t_min is not None and value_raw_min is not None:
+                    ax_prev.plot([t_min], [value_raw_min], marker='o', markerfacecolor='none',
+                                 markeredgecolor="#d81b60", markersize=5, label="Min")
                 ax_prev.set_xlabel("Time (s)")
                 ax_prev.set_ylabel("Voltage (V)")
                 ax_prev.grid(True, alpha=0.3)
@@ -4047,9 +4351,11 @@ class OscilloscopeAnalyzer(QMainWindow):
                     "slope": float(slope_val),
                     "intercept": float(intercept_val),
                     "t_at": float(t_peak),
-                    "value": float(val_corr),
+                    "value": float(value),
                     "value_raw": float(value_raw),
                     "baseline": float(baseline_peak),
+                    "t_min": float(t_min) if t_min is not None else None,
+                    "value_raw_min": float(value_raw_min) if value_raw_min is not None else None,
                 }
                 preview_state["ok"] = True
                 preview_state["data"] = data
@@ -4068,7 +4374,7 @@ class OscilloscopeAnalyzer(QMainWindow):
 
             if not preview_state["ok"]:
                 if not _recompute_preview():
-                    QMessageBox.warning(self, "SG Error", status_label.text() or "Failed to update low_pass_max.")
+                    QMessageBox.warning(self, "SG Error", status_label.text() or f"Failed to update {func_name}.")
                     return
 
             data = preview_state["data"]
@@ -4076,9 +4382,11 @@ class OscilloscopeAnalyzer(QMainWindow):
             slope_val = float(data["slope"])
             intercept_val = float(data["intercept"])
             t_peak = float(data["t_at"])
-            val_corr = float(data["value"])
+            value = float(data["value"])
             value_raw = float(data["value_raw"])
             baseline_peak = float(data["baseline"])
+            t_min = data.get("t_min")
+            value_raw_min = data.get("value_raw_min")
 
             ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
             line = rec.get("line")
@@ -4099,10 +4407,28 @@ class OscilloscopeAnalyzer(QMainWindow):
                                      color=color, markeredgecolor=color, markerfacecolor=color,
                                      markersize=6, label=label, zorder=4)
                 new_line.set_gid(key)
+            min_line = rec.get("min_line")
+            new_min_line = None
+            if use_peak_min and t_min is not None and value_raw_min is not None:
+                if min_line in ax.lines:
+                    min_line.set_marker('o')
+                    min_line.set_linestyle('None')
+                    min_line.set_color(color)
+                    min_line.set_markerfacecolor('none')
+                    min_line.set_markeredgecolor(color)
+                    min_line.set_data([t_min], [value_raw_min])
+                    new_min_line = min_line
+                else:
+                    new_min_line, = ax.plot([t_min], [value_raw_min], marker='o', linestyle='None',
+                                             color=color, markeredgecolor=color, markerfacecolor='none',
+                                             markersize=5, label="_nolegend_", zorder=4)
+                    new_min_line.set_gid(key)
+            elif min_line in ax.lines:
+                min_line.remove()
             rec.update({
                 "params": (int(w), float(slope_val), float(intercept_val)),
                 "param_names": ["width", "baseline_slope", "baseline_intercept"],
-                "value": float(val_corr),
+                "value": float(value),
                 "value_raw": float(value_raw),
                 "baseline": float(baseline_peak),
                 "t_at": float(t_peak),
@@ -4111,6 +4437,10 @@ class OscilloscopeAnalyzer(QMainWindow):
                 "dataset_id": rec.get("dataset_id", self.dataset_id),
                 "inverted": invert_flag,
             })
+            if new_min_line is not None:
+                rec["min_line"] = new_min_line
+            else:
+                rec.pop("min_line", None)
             rec.pop("param_errors", None)
             ax.legend()
             self.canvas.draw()
@@ -4205,6 +4535,9 @@ class OscilloscopeAnalyzer(QMainWindow):
         line = rec.get("line")
         if line in ax.lines:
             line.remove()
+        min_line = rec.get("min_line")
+        if min_line in ax.lines:
+            min_line.remove()
         ax.legend()
         self.canvas.draw()
         self.fit_info_window.update_info(self.results, self.event_combo.currentText())
@@ -4254,8 +4587,9 @@ class OscilloscopeAnalyzer(QMainWindow):
             t_sel, y_sel = t, y
         inverted = rec.get("inverted", False)
         ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
-        # Special handling for low_pass_max
-        if func_name == "low_pass_max":
+        # Special handling for low-pass extrema
+        if func_name in LOW_PASS_SPECIALS:
+            use_peak_min = func_name == "low_pass_peak_min"
             w = int(params[0]) if params else 201
             baseline_slope = float(params[1]) if len(params) > 1 else 0.0
             baseline_intercept = float(params[2]) if len(params) > 2 else 0.0
@@ -4268,12 +4602,13 @@ class OscilloscopeAnalyzer(QMainWindow):
                 w -= 1
             t_peak = rec.get("t_at")
             value_raw = rec.get("value_raw")
-            val_corr = rec.get("value")
+            value = rec.get("value")
             baseline_peak = rec.get("baseline")
             need_recalc = (
-                t_peak is None or value_raw is None or val_corr is None or baseline_peak is None
+                t_peak is None or value_raw is None or value is None or baseline_peak is None
             )
-            if need_recalc and len(t_sel) and len(y_sel):
+            y_f = None
+            if (need_recalc or use_peak_min) and len(t_sel) and len(y_sel):
                 y_proc = -y_sel if inverted else y_sel
                 baseline_vals = baseline_slope * t_sel + baseline_intercept
                 baseline_proc = -baseline_vals if inverted else baseline_vals
@@ -4281,20 +4616,40 @@ class OscilloscopeAnalyzer(QMainWindow):
                     y_f = sig.savgol_filter(y_proc - baseline_proc, w, 2)
                 except Exception:
                     return
-                i = int(np.argmax(y_f)) if y_f.size else 0
-                t_peak = float(t_sel[i]) if len(t_sel) else None
-                val_corr_proc = float(y_f[i]) if y_f.size else None
-                if t_peak is None or val_corr_proc is None:
-                    return
-                val_corr = -val_corr_proc if inverted else val_corr_proc
-                baseline_peak = float(baseline_slope * t_sel[i] + baseline_intercept)
-                value_raw = baseline_peak + val_corr
-                rec.setdefault("value", float(val_corr))
-                rec.setdefault("baseline", float(baseline_peak))
-                rec.setdefault("value_raw", float(value_raw))
-                rec.setdefault("t_at", float(t_peak))
+                if need_recalc:
+                    i = int(np.argmax(y_f)) if y_f.size else 0
+                    t_peak = float(t_sel[i]) if len(t_sel) else None
+                    val_corr_proc = float(y_f[i]) if y_f.size else None
+                    if t_peak is None or val_corr_proc is None:
+                        return
+                    val_corr = -val_corr_proc if inverted else val_corr_proc
+                    if use_peak_min:
+                        val_min_proc = float(np.min(y_f)) if y_f.size else None
+                        if val_min_proc is None:
+                            return
+                        val_min = -val_min_proc if inverted else val_min_proc
+                        value = val_corr - val_min
+                    else:
+                        value = val_corr
+                    baseline_peak = float(baseline_slope * t_sel[i] + baseline_intercept)
+                    value_raw = baseline_peak + val_corr
+                    rec.setdefault("value", float(value))
+                    rec.setdefault("baseline", float(baseline_peak))
+                    rec.setdefault("value_raw", float(value_raw))
+                    rec.setdefault("t_at", float(t_peak))
             if t_peak is None or value_raw is None:
                 return
+            t_min = None
+            value_raw_min = None
+            if use_peak_min and y_f is not None and y_f.size:
+                i_min = int(np.argmin(y_f))
+                t_min = float(t_sel[i_min]) if len(t_sel) else None
+                val_min_proc = float(y_f[i_min]) if y_f.size else None
+                if t_min is None or val_min_proc is None:
+                    return
+                val_min = -val_min_proc if inverted else val_min_proc
+                baseline_min = float(baseline_slope * t_sel[i_min] + baseline_intercept)
+                value_raw_min = baseline_min + val_min
             line = rec.get("line")
             if line in ax.lines:
                 line.remove()
@@ -4307,6 +4662,19 @@ class OscilloscopeAnalyzer(QMainWindow):
                                  markersize=6, label=label, zorder=4)
             new_line.set_gid(key)
             rec["line"] = new_line
+            min_line = rec.get("min_line")
+            if use_peak_min and t_min is not None and value_raw_min is not None:
+                if min_line in ax.lines:
+                    min_line.remove()
+                new_min_line, = ax.plot([t_min], [value_raw_min], marker='o', linestyle='None',
+                                        color=color, markeredgecolor=color, markerfacecolor='none',
+                                        markersize=5, label="_nolegend_", zorder=4)
+                new_min_line.set_gid(key)
+                rec["min_line"] = new_min_line
+            else:
+                if min_line in ax.lines:
+                    min_line.remove()
+                rec.pop("min_line", None)
             if region is not None:
                 ax.axvline(region[0], color="red", linestyle="--", alpha=0.7)
                 ax.axvline(region[1], color="red", linestyle="--", alpha=0.7)
@@ -4439,7 +4807,7 @@ class OscilloscopeAnalyzer(QMainWindow):
                 param_names = list(names)
                 for n, v in zip(names, params):
                     row[n] = v
-                # Common optional fields for generic/special fits (e.g., low_pass_max)
+                # Common optional fields for generic/special fits (e.g., low_pass_max/low_pass_peak_min)
                 if 'impact_time' in rec:
                     row['impact_time'] = rec['impact_time']
                 if 'radius' in rec:
@@ -4877,9 +5245,28 @@ class OscilloscopeAnalyzer(QMainWindow):
 
         # Clear the results dict
         self.results.clear()
+        # Drop SG overlays stored in memory
+        self.sg_filtered.clear()
+        self.sg_filtered_meta.clear()
+        # Remove cached SG files so overlays do not restore on event changes
+        cache_dir = self._sg_cache_dir_path()
+        if cache_dir and os.path.isdir(cache_dir):
+            for name in os.listdir(cache_dir):
+                path = os.path.join(cache_dir, name)
+                if not os.path.isfile(path):
+                    continue
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
         # Remove plotted fit lines and impact lines
         for ax in self.figure.axes:
-            lines_to_remove = [ln for ln in ax.lines if ln.get_linestyle() == '-.' or ln.get_label().endswith('Fit')]
+            lines_to_remove = [
+                ln for ln in ax.lines
+                if ln.get_linestyle() == '-.'
+                or str(ln.get_label()).endswith('Fit')
+                or ln.get_label() == 'SG Filter'
+            ]
             for ln in lines_to_remove:
                 ax.lines.remove(ln)
             ax.legend()
@@ -4914,18 +5301,26 @@ class OscilloscopeAnalyzer(QMainWindow):
                 ch_default = 1
 
         # interactive rescan/review/apply loop
-        prev = dict(ev0=evt_min, ev1=evt_max, ch=ch_default, thr=5.0, use_abs=True)
+        prev = dict(ev0=evt_min, ev1=evt_max, ch=ch_default, thr=5.0, smooth=0, use_abs=True, detrend=False)
         while True:
-            scan_dlg = FeatureScanDialog(self, prev['ev0'], prev['ev1'], ch_default=prev['ch'], thr_default=prev['thr'])
+            scan_dlg = FeatureScanDialog(
+                self,
+                prev['ev0'],
+                prev['ev1'],
+                ch_default=prev['ch'],
+                thr_default=prev['thr'],
+                smooth_default=prev['smooth'],
+            )
             scan_dlg.abs_chk.setChecked(prev.get('use_abs', True))
+            scan_dlg.detrend_chk.setChecked(prev.get('detrend', False))
             if scan_dlg.exec_() != QDialog.Accepted:
                 return  # cancel
             try:
-                ev0, ev1, ch, thr_mult, use_abs = scan_dlg.values()
+                ev0, ev1, ch, thr_mult, smooth, use_abs, use_detrend = scan_dlg.values()
             except Exception as e:
                 QMessageBox.warning(self, "Invalid Input", str(e))
                 continue
-            prev.update(ev0=ev0, ev1=ev1, ch=ch, thr=thr_mult, use_abs=use_abs)
+            prev.update(ev0=ev0, ev1=ev1, ch=ch, thr=thr_mult, smooth=smooth, use_abs=use_abs, detrend=use_detrend)
 
             targets = [key for (iv, key) in ev_pairs if ev0 <= iv <= ev1]
             if not targets:
@@ -4936,6 +5331,31 @@ class OscilloscopeAnalyzer(QMainWindow):
             prog.setWindowModality(Qt.ApplicationModal)
             prog.setAutoClose(True)
             prog.show()
+
+            def _robust_sigma(arr):
+                if arr.size == 0:
+                    return 0.0
+                med = float(np.median(arr))
+                mad = float(np.median(np.abs(arr - med)))
+                return 1.4826 * mad
+
+            def _sg_window(n):
+                max_w = max(0, n - 1)
+                if max_w < 5:
+                    return None
+                if smooth > 0:
+                    w = min(int(smooth), max_w)
+                else:
+                    try:
+                        default_w = int(self.sg_win.value())
+                    except Exception:
+                        default_w = 201
+                    w = min(default_w, max_w)
+                if w % 2 == 0:
+                    w -= 1
+                if w < 5:
+                    return None
+                return int(w)
 
             matches = []
             for i, key in enumerate(targets, start=1):
@@ -4957,11 +5377,30 @@ class OscilloscopeAnalyzer(QMainWindow):
                     y = np.asarray(y, dtype=np.float64)
                 except Exception:
                     continue
-                sd = float(np.std(y))
-                if sd <= 0:
+                if use_detrend:
+                    try:
+                        y = sig.detrend(y, type='linear')
+                    except Exception:
+                        continue
+                y_scan = y
+                w = _sg_window(len(y_scan))
+                if w is not None:
+                    try:
+                        y_smooth = sig.savgol_filter(y_scan, w, 2)
+                    except Exception:
+                        y_smooth = y_scan
+                else:
+                    y_smooth = y_scan
+                resid = y_scan - y_smooth
+                sigma = _robust_sigma(resid)
+                if sigma <= 0:
+                    sigma = float(np.std(resid)) if resid.size else 0.0
+                if sigma <= 0:
+                    sigma = float(np.std(y_scan)) if y_scan.size else 0.0
+                if sigma <= 0:
                     continue
-                peak = float(np.max(np.abs(y))) if use_abs else float(np.max(y))
-                if peak > thr_mult * sd:
+                peak = float(np.max(np.abs(y_smooth))) if use_abs else float(np.max(y_smooth))
+                if peak > thr_mult * sigma:
                     matches.append(key)
 
             prog.setValue(len(targets))
@@ -5176,27 +5615,60 @@ class OscilloscopeAnalyzer(QMainWindow):
         help_text = (
             "Oscilloscope Palantir\n\n"
             "Purpose: Interactive analysis of LeCroy .trc waveforms — load events, filter, fit pulses, match metadata, and export results.\n\n"
-            "Controls (by row):\n"
-            "• Select Folder (F), Event dropdown, Folder path label.\n"
-            "• Navigation: Prev/Next (, .), Decim.  Session: Clear Event Fits (E), Save (Ctrl+S), Export (Ctrl+E), Load (Ctrl+I), Clear Data (Shift+D), Fit Info (U).\n"
-            "• Metadata/Impact: Load Metadata (L), MetaMatch (M), D3Dist, Mark Impact (T).\n"
-            "• SG Row: SG Filter (S), Chan, Width, SG Batch (Ctrl+B), Clear SG (Shift+S), Preserve Axes (menu) | Results Plotter (P), Feature Scan (Ctrl+F), Fit Filter (Ctrl+Shift+F), Clear Filter (Ctrl+K).\n"
-            "• Dynamic Row: Fit Func (QD3Fit/QDMFit/CSA/skew_gaussian/gaussian/FFT/low_pass_max), Chan (1–8), Invert (I), Run (Enter), Adjust (A), Clear (R), Clear Chan Fits (Shift+R), Batch (B), Use SG (Ctrl+Shift+S).\n\n"
+            "Button Reference (main window):\n"
+            "Top row:\n"
+            "• Select Folder (F): Choose a folder of .trc files and load the event list.\n"
+            "• Help (H): Open this help dialog.\n"
+            "• Light Mode / Dark Mode: Toggle the UI theme (Ctrl+T).\n"
+            "Navigation / session row:\n"
+            "• Prev (<): Load the previous event.\n"
+            "• Next (>): Load the next event.\n"
+            "• Co-Add Waves: Combine selected events into a summed or averaged waveform.\n"
+            "• Clear Event Fits: Remove all fits for the current event (E).\n"
+            "• Save Figure: Save the current plot to an image file (Ctrl+S).\n"
+            "• Export Fits: Export all fits to an HDF5 file (Ctrl+E).\n"
+            "• Load Fits: Import fits from an HDF5 file and merge into the session (Ctrl+I).\n"
+            "• Clear Data: Clear all loaded data and fits from memory (Shift+D).\n"
+            "• Fit Info (U): Open the fit summary table.\n"
+            "Metadata / impact row:\n"
+            "• Load Metadata (L): Load a metadata CSV for MetaMatch.\n"
+            "• MetaMatch (M): Find the best metadata match using the active QD3/QDM fit.\n"
+            "• Mark Impact (T): Plot a vertical impact marker using distance/velocity.\n"
+            "SG / discovery row:\n"
+            "• SG Filter (S): Run Savitzky-Golay filtering on the selected channel.\n"
+            "• Batch Run: Run SG filtering across a range of events (Ctrl+B).\n"
+            "• Clear Fit: Remove the SG overlay for the current event/channel (Shift+S).\n"
+            "• Preserve Axes: Select which channels keep their zoom/pan across events.\n"
+            "• Results Plotter (P): Open the dataset-level results visualization window.\n"
+            "• Feature Scan: Search events for large excursions vs. robust sigma; optional detrend (Ctrl+F).\n"
+            "• Fit Filter: Filter the event list using fit parameter constraints (Ctrl+Shift+F).\n"
+            "• Quality Filter: Filter events by quality rating threshold.\n"
+            "• Clear Filter: Restore the full event list (Ctrl+K).\n"
+            "Dynamic fit row:\n"
+            "• Run Fit: Execute the selected fit on the chosen channel/region (Enter).\n"
+            "• Adjust Fit (A): Edit initial parameters before running the fit.\n"
+            "• Clear Fit (R): Remove the active dynamic fit result.\n"
+            "• Clear Chan Fits (Shift+R): Remove all fits on the selected channel for this event.\n"
+            "• Batch Run (B): Run the selected fit across multiple events (time window or impact-centered).\n"
+            "Toggles:\n"
+            "• Invert (I): Invert polarity for fitting (also flips low_pass_max/low_pass_peak_min extremum).\n"
+            "• Use SG (Ctrl+Shift+S): Use SG-filtered data for fits/FFT when available.\n\n"
             "Notes:\n"
             "• Fits run on raw data by default; QD3/QDM use SG only for initial parameter guessing.\n"
             "• SG Batch runs multi-threaded and caches filtered traces (per channel + window) for rapid recall; clearing SG removes the cached trace for that channel/event.\n"
-            "• Preserve Axes selects which channels keep zoom/pan ranges across events; unselected channels auto-scale.\n"
+            "• Preserve Axes keeps zoom/pan ranges across events for selected channels; unselected channels auto-scale.\n"
             "• ‘Use SG’ applies SG-filtered data (if present) to Run Fit, Adjust Fit, and FFT.\n"
             "• FFT opens a popup spectrum with pan/zoom toolbar in log–log scale.\n"
-            "• low_pass_max performs an SG low‑pass in the selection and reports the extremum.\n\n"
+            "• low_pass_max performs an SG low-pass in the selection and reports the extremum.\n"
+            "• low_pass_peak_min uses the same detrend + SG filter, then reports peak - min.\n\n"
             "Hotkeys:\n"
             "  Navigation:  , / .  (Prev/Next),  T (Mark Impact)\n"
             "  Files:       F (Select Folder),  Ctrl+S (Save),  Ctrl+E (Export),  Ctrl+I (Load),  Shift+D (Clear Data)\n"
             "  Meta:        L (Load Metadata),  M (MetaMatch)\n"
             "  SG/Filters:  S (SG),  Ctrl+B (SG Batch),  Shift+S (Clear SG),  P (Results Plotter),  Ctrl+F (Feature Scan),  Ctrl+Shift+F (Fit Filter),  Ctrl+K (Clear Filter)\n"
             "  Dynamic:     Enter (Run),  A (Adjust),  R (Clear Fit),  Shift+R (Clear Chan Fits),  B (Batch),  Ctrl+Shift+S (Toggle Use SG)\n"
-            "               Q/D/C/W/G/X selects QD3/QDM/CSA/skew/gauss/low_pass_max; 1–8 selects channel; I toggles invert.\n"
-            "  Info:        H (Help),  U (Fit Info)\n"
+            "               Q/D/C/W/G/X/Z selects QD3/QDM/CSA/skew/gauss/low_pass_max/low_pass_peak_min; 1-8 selects channel; I toggles invert.\n"
+            "  Info:        H (Help),  U (Fit Info),  Ctrl+T (Theme)\n"
         )
         dlg = QDialog(self)
         dlg.setWindowTitle("Help")
