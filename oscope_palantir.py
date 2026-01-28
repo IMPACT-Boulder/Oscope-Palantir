@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRegExp, QSettings
-from PyQt5.QtGui import QRegExpValidator, QKeySequence
+from PyQt5.QtGui import QRegExpValidator, QKeySequence, QValidator
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QDoubleSpinBox, QSpinBox,
     QPushButton, QComboBox, QFileDialog, QMessageBox, QLabel, QCheckBox, QDialog, QInputDialog,
@@ -76,6 +76,8 @@ LOW_PASS_SPECIALS = {"low_pass_max", "low_pass_peak_min"}
 RAW_TRACE_COLOR   = "C0"          # keep default blue for raw data
 SG_FILTER_COLOR   = "#43a047"     # brighter green for SG overlay
 SG_FILTER_STYLE   = dict(color=SG_FILTER_COLOR, linewidth=1.0, alpha=0.85, zorder=2.4)
+BANDPASS_FILTER_COLOR = "#f9a825"  # amber overlay for bandpass
+BANDPASS_FILTER_STYLE = dict(color=BANDPASS_FILTER_COLOR, linewidth=1.0, alpha=0.85, zorder=2.35)
 FIT_LINE_WIDTH    = 1.0
 FIT_COLOR_PRESETS = {
     "QD3Fit": "#ff8f00",         # deep orange
@@ -171,6 +173,14 @@ class FitInfoWindow(QWidget):
             ch = int(ch_str)
     
             row = {"event": event, "channel": ch, "fit_type": fit_type, "dataset_id": rec.get("dataset_id")}
+            density = rec.get("density")
+            if density is None:
+                try:
+                    density = self.parent()._get_density_for_dataset(rec.get("dataset_id"))
+                except Exception:
+                    density = None
+            if density is not None:
+                row["density"] = density
             params = rec.get("params", ())
             ft = fit_type.lower()
     
@@ -218,6 +228,8 @@ class FitInfoWindow(QWidget):
                 if "value_raw" in rec: row["value_raw"] = rec["value_raw"]
                 if "baseline" in rec: row["baseline"] = rec["baseline"]
                 if "t_at" in rec: row["t_at"] = rec["t_at"]
+                if "peak_rel_baseline" in rec: row["peak_rel_baseline"] = rec["peak_rel_baseline"]
+                if "min_rel_baseline" in rec: row["min_rel_baseline"] = rec["min_rel_baseline"]
     
             records.append(row)
     
@@ -1058,6 +1070,49 @@ class FitWorker(QThread):
             self.result.emit(None, e)
 
 
+class SciDoubleSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox that displays values in scientific notation."""
+
+    _sci_re = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$")
+
+    def __init__(self, sci_decimals=3, parent=None):
+        super().__init__(parent)
+        self._sci_decimals = int(max(0, sci_decimals))
+
+    def set_scientific_decimals(self, decimals):
+        try:
+            self._sci_decimals = int(max(0, decimals))
+        except Exception:
+            self._sci_decimals = 3
+        self.update()
+
+    def setDecimals(self, prec):
+        super().setDecimals(prec)
+        try:
+            self._sci_decimals = int(max(0, prec))
+        except Exception:
+            self._sci_decimals = 3
+
+    def textFromValue(self, value):
+        return f"{float(value):.{self._sci_decimals}e}"
+
+    def valueFromText(self, text):
+        try:
+            return float(str(text).strip())
+        except Exception:
+            return 0.0
+
+    def validate(self, text, pos):
+        t = str(text).strip()
+        if t in ("", "+", "-", ".", "+.", "-."):
+            return (QValidator.Intermediate, text, pos)
+        if re.match(r"^[+-]?(\d+(\.\d*)?|\.\d+)[eE][+-]?$", t):
+            return (QValidator.Intermediate, text, pos)
+        if self._sci_re.match(t):
+            return (QValidator.Acceptable, text, pos)
+        return (QValidator.Invalid, text, pos)
+
+
 class OscilloscopeAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1085,11 +1140,19 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.sg_filtered     = {}
         self.sg_filtered_meta = {}
         self.sg_cache_dir    = None
+        self.bp_filtered     = {}
+        self.bp_filtered_meta = {}
+        self.bp_cache_dir    = None
         # Persist user-defined axis limits per channel when preservation is enabled
         self.channel_axis_limits = {}
         self.preserve_axes_channels = set()
         self._preserve_axis_actions = {}
         self._preserve_axes_menu_channels = [1, 2, 3, 4]
+        self.dataset_densities = {}
+        self._density_spin_guard = False
+        self.hidden_channels = set()
+        self._channel_visibility_actions = {}
+        self._channel_visibility_menu_channels = [1, 2, 3, 4]
         self._suspend_axis_capture = False
         self.metaArr         = None
         self._fit_color_map  = dict(FIT_COLOR_PRESETS)
@@ -1099,6 +1162,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         cpu_threads = max(1, os.cpu_count() or 1)
         self._sg_batch_thread_count = min(4, cpu_threads)
         self._axis_to_channel = {}
+        self._channel_to_axis = {}
         self._axis_event_ids = []
 
         def wrap_control(label_text, control):
@@ -1153,6 +1217,18 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.quality_spin.setFixedWidth(btn_width)
         self.quality_spin.setMaximumHeight(btn_height)
         ctrl_layout.addWidget(wrap_control("Quality:", self.quality_spin))
+
+        # Dust density per dataset
+        self.density_spin = QDoubleSpinBox()
+        self.density_spin.setRange(0.0, 100.0)
+        self.density_spin.setDecimals(4)
+        self.density_spin.setSingleStep(0.1)
+        self.density_spin.setValue(7.5)
+        self.density_spin.setToolTip("Dust density for current dataset (g/cc)")
+        self.density_spin.valueChanged.connect(self._on_density_changed)
+        self.density_spin.setFixedWidth(btn_width)
+        self.density_spin.setMaximumHeight(btn_height)
+        ctrl_layout.addWidget(wrap_control("Density (g/cc):", self.density_spin))
 
         #self.quality_hint = QLabel("Use Quality to tag current event (auto-saved per dataset).")
         #self.quality_hint.setStyleSheet("font-size: 11px; color: #999999;")
@@ -1399,11 +1475,25 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.preserve_axes_menu = QMenu(self)
         self.preserve_axes_button.setMenu(self.preserve_axes_menu)
         self._rebuild_preserve_axes_menu()
+
+        # Channel visibility toggle menu
+        self.channel_visibility_button = QToolButton()
+        self.channel_visibility_button.setIcon(qta.icon('fa5s.eye', color=self.accent))
+        self.channel_visibility_button.setText("Channels")
+        self.channel_visibility_button.setToolTip("Toggle which channel plots are shown")
+        self.channel_visibility_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.channel_visibility_button.setPopupMode(QToolButton.InstantPopup)
+        self.channel_visibility_button.setFixedWidth(self.unit_width)
+        self.channel_visibility_button.setMaximumHeight(btn_height)
+        self.channel_visibility_menu = QMenu(self)
+        self.channel_visibility_button.setMenu(self.channel_visibility_menu)
+        self._rebuild_channel_visibility_menu()
         clear_preserve_layout = QHBoxLayout()
         clear_preserve_layout.setContentsMargins(0, 0, 0, 0)
         clear_preserve_layout.setSpacing(preserve_axes_spacing)
         clear_preserve_layout.addWidget(self.btn_clear_sg)
         clear_preserve_layout.addWidget(self.preserve_axes_button)
+        clear_preserve_layout.addWidget(self.channel_visibility_button)
         sg_layout.addLayout(clear_preserve_layout)
 
         # Right-aligned scanning/filtering controls on same row
@@ -1448,6 +1538,75 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_clear_filter.setMaximumHeight(btn_height)
         self.btn_clear_filter.clicked.connect(self.clear_event_filter)
         sg_layout.addWidget(self.btn_clear_filter)
+
+        ####################
+        # Bandpass filter row
+        ####################
+        bp_layout = QHBoxLayout()
+        bp_layout.setContentsMargins(0, 0, 0, 0)
+        bp_layout.setSpacing(6)
+        layout.addLayout(bp_layout)
+        layout.setAlignment(bp_layout, Qt.AlignLeft)
+
+        self.btn_bandpass = QPushButton("Bandpass")
+        self.btn_bandpass.setIcon(qta.icon('fa5s.filter', color=self.accent))
+        self.btn_bandpass.setToolTip("Apply Butterworth bandpass filter (Shift+B)")
+        self.btn_bandpass.clicked.connect(self.run_bandpass_filter)
+        self.btn_bandpass.setFixedWidth(self.unit_width)
+        self.btn_bandpass.setMaximumHeight(btn_height)
+        bp_layout.addWidget(self.btn_bandpass)
+
+        self.bp_ch = QComboBox()
+        self.bp_ch.addItems([str(i) for i in range(1, 5)])
+        self.bp_ch.setCurrentText("1")
+        self.bp_ch.setMaximumHeight(btn_height)
+        self.bp_ch.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        bp_layout.addWidget(wrap_control("Chan:", self.bp_ch))
+
+        self.bp_low = SciDoubleSpinBox()
+        self.bp_low.setRange(0.0, 1e9)
+        self.bp_low.setDecimals(1)
+        self.bp_low.setSingleStep(100.0)
+        self.bp_low.setValue(1000.0)
+        self.bp_low.setToolTip("Low cutoff frequency (Hz)")
+        self.bp_low.setFixedWidth(btn_width + 20)
+        self.bp_low.setMaximumHeight(btn_height)
+        bp_layout.addWidget(wrap_control("Low Hz:", self.bp_low))
+
+        self.bp_high = SciDoubleSpinBox()
+        self.bp_high.setRange(0.0, 1e9)
+        self.bp_high.setDecimals(1)
+        self.bp_high.setSingleStep(100.0)
+        self.bp_high.setValue(100000.0)
+        self.bp_high.setToolTip("High cutoff frequency (Hz)")
+        self.bp_high.setFixedWidth(btn_width + 20)
+        self.bp_high.setMaximumHeight(btn_height)
+        bp_layout.addWidget(wrap_control("High Hz:", self.bp_high))
+
+        self.bp_order = QSpinBox()
+        self.bp_order.setRange(1, 12)
+        self.bp_order.setValue(4)
+        self.bp_order.setToolTip("Butterworth filter order")
+        self.bp_order.setFixedWidth(btn_width)
+        self.bp_order.setMaximumHeight(btn_height)
+        bp_layout.addWidget(wrap_control("Order:", self.bp_order))
+
+        self.btn_clear_bp = QPushButton("Clear BP")
+        self.btn_clear_bp.setIcon(qta.icon('fa5s.times', color=self.accent))
+        self.btn_clear_bp.setToolTip("Remove bandpass overlay for current channel")
+        self.btn_clear_bp.clicked.connect(self.clear_bandpass_filter)
+        self.btn_clear_bp.setFixedWidth(self.unit_width)
+        self.btn_clear_bp.setMaximumHeight(btn_height)
+        bp_layout.addWidget(self.btn_clear_bp)
+
+        self.btn_bp_bode = QPushButton("Bode")
+        self.btn_bp_bode.setIcon(qta.icon('fa5s.chart-area', color=self.accent))
+        self.btn_bp_bode.setToolTip("Show bandpass frequency response")
+        self.btn_bp_bode.clicked.connect(self.show_bandpass_bode)
+        self.btn_bp_bode.setFixedWidth(self.unit_width)
+        self.btn_bp_bode.setMaximumHeight(btn_height)
+        bp_layout.addWidget(self.btn_bp_bode)
+        bp_layout.addStretch()
 
         ####################
         # Dynamic fit row
@@ -1537,6 +1696,12 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.use_sg_toggle.setMaximumHeight(btn_height)
         ctrl_layout5.addWidget(self.use_sg_toggle)
 
+        self.use_bp_toggle = QCheckBox("Use BP")
+        self.use_bp_toggle.setToolTip("Use bandpass-filtered data if available for fits/FFT (current event only)")
+        self.use_bp_toggle.setFixedWidth(self.unit_width+2)
+        self.use_bp_toggle.setMaximumHeight(btn_height)
+        ctrl_layout5.addWidget(self.use_bp_toggle)
+
         ctrl_layout5.addStretch()
 
         ####################
@@ -1569,15 +1734,17 @@ class OscilloscopeAnalyzer(QMainWindow):
 
     def set_controls_enabled(self, enabled):
         widgets = [
-            self.event_combo, self.btn_prev, self.btn_next, self.decim_spin, self.quality_spin,
+            self.event_combo, self.btn_prev, self.btn_next, self.decim_spin, self.quality_spin, self.density_spin,
             self.btn_coadd,
             self.btn_load_meta, self.btn_meta, self.dist_spin, self.btn_mark_impact,
             self.btn_clear, self.btn_save_fig, self.btn_export, self.btn_import,
             self.btn_clear_data, self.btn_show_info,
             self.btn_sg, self.sg_ch, self.sg_win,
             self.btn_batch_sg, self.btn_clear_sg, self.preserve_axes_button, self.btn_results_plotter, self.btn_feature_scan, self.btn_fit_filter, self.btn_quality_filter, self.btn_clear_filter,
+            self.btn_bandpass, self.bp_ch, self.bp_low, self.bp_high, self.bp_order, self.btn_clear_bp, self.btn_bp_bode,
+            self.channel_visibility_button,
             self.dyn_func_combo, self.btn_dyn, self.btn_batch_dyn, self.dyn_ch_combo,
-            self.dyn_invert, self.dyn_decim_spin, self.use_sg_toggle, self.btn_adjust_dyn, self.btn_clear_dyn, self.btn_clear_chan
+            self.dyn_invert, self.dyn_decim_spin, self.use_sg_toggle, self.use_bp_toggle, self.btn_adjust_dyn, self.btn_clear_dyn, self.btn_clear_chan
         ]
         for w in widgets:
             w.setEnabled(enabled)
@@ -1700,7 +1867,9 @@ class OscilloscopeAnalyzer(QMainWindow):
         #self.dataset_id = str(Path(folder).resolve())
         self.dataset_id = os.path.abspath(folder)
         self.sg_cache_dir = os.path.join(self.dataset_id, ".palantir_sg")
+        self.bp_cache_dir = os.path.join(self.dataset_id, ".palantir_bp")
         self.channel_axis_limits.clear()
+        self._sync_density_spin(self.dataset_id)
         self.folder_label.setText(f"Folder: {folder}")
         self.folder_label.setToolTip(folder)
 
@@ -1767,6 +1936,8 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.span_selectors.clear()
         self.sg_filtered.clear()
         self.sg_filtered_meta.clear()
+        self.bp_filtered.clear()
+        self.bp_filtered_meta.clear()
         self.meta_label.setText("MetaMatch result will appear here.")
         
         if not evt:
@@ -1794,6 +1965,8 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.plot_waveforms()
         # Restore and overlay any cached SG traces for this width
         self._restore_cached_sg(evt)
+        # Restore and overlay any cached BP traces for current settings
+        self._restore_cached_bp(evt)
 
         # Now recall and replot any existing fits for this event
         self.recall_fits_for_event(evt)
@@ -1810,6 +1983,18 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.quality_spin.setValue(max(0, min(5, value)))
         self._quality_spin_guard = False
 
+    def _sync_density_spin(self, dataset_id=None):
+        if not hasattr(self, "density_spin"):
+            return
+        ds = dataset_id or getattr(self, "dataset_id", None)
+        self._density_spin_guard = True
+        try:
+            value = float(self.dataset_densities.get(ds, 7.5)) if ds else 7.5
+        except Exception:
+            value = 7.5
+        self.density_spin.setValue(value)
+        self._density_spin_guard = False
+
     def _on_quality_changed(self, value):
         if self._quality_spin_guard:
             return
@@ -1820,6 +2005,52 @@ class OscilloscopeAnalyzer(QMainWindow):
             self.event_quality.pop(evt, None)
         else:
             self.event_quality[evt] = int(value)
+
+    def _on_density_changed(self, value):
+        if self._density_spin_guard:
+            return
+        ds = getattr(self, "dataset_id", None)
+        if not ds:
+            return
+        try:
+            self.dataset_densities[ds] = float(value)
+        except Exception:
+            pass
+        self._recompute_density_dependent_metrics(ds)
+        self.fit_info_window.update_info(self.results, self.event_combo.currentText())
+
+    def _recompute_density_dependent_metrics(self, dataset_id):
+        if not dataset_id:
+            return
+        rho_si = self._get_density_si_for_dataset(dataset_id)
+        density_gcc = self._get_density_for_dataset(dataset_id)
+        pattern = re.compile(r'^evt_\d+_(.+)_ch(\d+)(?:_\d+)?$')
+        for key, rec in self.results.items():
+            if rec.get('dataset_id') != dataset_id:
+                continue
+            m = pattern.match(key)
+            if not m:
+                continue
+            fit_type = m.group(1).lower()
+            params = rec.get("params", ())
+            if len(params) < 3:
+                continue
+            try:
+                if fit_type.startswith("qd3"):
+                    charge, mass, rad = QD3Cal(params[1], params[2], rho=rho_si)
+                elif fit_type.startswith("qdm"):
+                    charge, mass, rad = QDMCal(params[1], params[2], rho=rho_si)
+                else:
+                    continue
+                rec.update({
+                    "charge": charge,
+                    "mass": mass,
+                    "radius": rad,
+                    "density": density_gcc,
+                })
+                self.results[key] = rec
+            except Exception:
+                continue
 
     def recall_fits_for_event(self, evt):
         """Recall and replot all fits for the given event"""
@@ -1912,6 +2143,10 @@ class OscilloscopeAnalyzer(QMainWindow):
             idx = self.sg_ch.findText(ch_text)
             if idx != -1:
                 self.sg_ch.setCurrentText(ch_text)
+        if hasattr(self, "bp_ch") and self.bp_ch.isEnabled():
+            idx = self.bp_ch.findText(ch_text)
+            if idx != -1:
+                self.bp_ch.setCurrentText(ch_text)
 
     def keyPressEvent(self, event):  
         if getattr(self, '_shortcuts_installed', False):
@@ -2034,6 +2269,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         # SG row extras
         add_shortcut(Qt.CTRL + Qt.Key_B, lambda: (self.btn_batch_sg.isEnabled() and self.btn_batch_sg.click()))
         add_shortcut(Qt.SHIFT + Qt.Key_S, lambda: (self.btn_clear_sg.isEnabled() and self.clear_sg_filter()))
+        add_shortcut(Qt.SHIFT + Qt.Key_B, lambda: (self.btn_bandpass.isEnabled() and self.run_bandpass_filter()))
         add_shortcut(Qt.Key_P, lambda: (self.btn_results_plotter.isEnabled() and self.open_results_plotter()))
         add_shortcut(Qt.CTRL + Qt.Key_F, lambda: (self.btn_feature_scan.isEnabled() and self.run_feature_scan()))
         add_shortcut(Qt.CTRL + Qt.SHIFT + Qt.Key_F, lambda: (self.btn_fit_filter.isEnabled() and self.run_fit_filter()))
@@ -2198,6 +2434,77 @@ class OscilloscopeAnalyzer(QMainWindow):
             self._refresh_current_event_plots()
         self._update_preserve_axes_button_text()
 
+    def _visible_channels(self):
+        if not self.current_data:
+            return []
+        return [ch for ch in sorted(self.current_data.keys()) if ch not in self.hidden_channels]
+
+    def _get_axis_for_channel(self, ch):
+        return self._channel_to_axis.get(ch)
+
+    def _format_channel_visibility_indicator(self):
+        hidden = sorted(self.hidden_channels)
+        if not hidden:
+            return ""
+        return " • " + ",".join(str(ch) for ch in hidden)
+
+    def _update_channel_visibility_button_text(self):
+        base_label = "Channels"
+        suffix = self._format_channel_visibility_indicator()
+        label = base_label + suffix
+        if not suffix:
+            tip = "Toggle which channel plots are shown"
+        else:
+            tip = f"Hidden channels: {suffix.replace(' • ', '')}. Click to edit."
+        self.channel_visibility_button.setText(label)
+        self.channel_visibility_button.setToolTip(tip)
+
+    def _rebuild_channel_visibility_menu(self, channels=None):
+        if channels is None:
+            channels = self._channel_visibility_menu_channels
+        channels = sorted({int(ch) for ch in channels if ch is not None})
+        if not channels:
+            channels = [1, 2, 3, 4]
+        self._channel_visibility_menu_channels = channels
+        self.channel_visibility_menu.clear()
+        show_all_action = self.channel_visibility_menu.addAction("Show All")
+        show_all_action.triggered.connect(self._show_all_channels)
+        hide_all_action = self.channel_visibility_menu.addAction("Hide All")
+        hide_all_action.triggered.connect(self._hide_all_channels)
+        self.channel_visibility_menu.addSeparator()
+        self._channel_visibility_actions = {}
+        for ch in channels:
+            action = self.channel_visibility_menu.addAction(f"Channel {ch}")
+            action.setCheckable(True)
+            action.setChecked(ch not in self.hidden_channels)
+            action.toggled.connect(lambda checked, ch=ch: self._on_channel_visibility_toggled(ch, checked))
+            self._channel_visibility_actions[ch] = action
+        self._update_channel_visibility_button_text()
+
+    def _set_hidden_channels(self, channels):
+        channels = {int(ch) for ch in channels if ch is not None}
+        self.hidden_channels = set(channels)
+        for ch, action in self._channel_visibility_actions.items():
+            action.blockSignals(True)
+            action.setChecked(ch not in self.hidden_channels)
+            action.blockSignals(False)
+        self._update_channel_visibility_button_text()
+        self._refresh_current_event_plots()
+
+    def _show_all_channels(self):
+        self._set_hidden_channels(set())
+
+    def _hide_all_channels(self):
+        self._set_hidden_channels(set(self._channel_visibility_menu_channels))
+
+    def _on_channel_visibility_toggled(self, channel, checked):
+        if checked:
+            self.hidden_channels.discard(channel)
+        else:
+            self.hidden_channels.add(channel)
+        self._update_channel_visibility_button_text()
+        self._refresh_current_event_plots()
+
     def _capture_current_axis_limits(self, only_missing=False, channels=None):
         if not self.current_data:
             return
@@ -2227,6 +2534,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             return
         self.plot_waveforms()
         self._redraw_sg_overlays()
+        self._redraw_bandpass_overlays()
         self.recall_fits_for_event(evt)
         self.fit_info_window.update_info(self.results, evt)
 
@@ -2274,13 +2582,9 @@ class OscilloscopeAnalyzer(QMainWindow):
         """Overlay SG line for a channel, replacing any prior SG curve."""
         if not self.current_data:
             return
-        sorted_chs = sorted(self.current_data.keys())
-        if ch not in sorted_chs:
+        ax = self._get_axis_for_channel(ch)
+        if ax is None:
             return
-        idx = sorted_chs.index(ch)
-        if idx >= len(self.figure.axes):
-            return
-        ax = self.figure.axes[idx]
         for ln in list(ax.get_lines()):
             if ln.get_label() == 'SG Filter':
                 try:
@@ -2288,6 +2592,29 @@ class OscilloscopeAnalyzer(QMainWindow):
                 except Exception:
                     pass
         ax.plot(t, y_sg, label="SG Filter", **SG_FILTER_STYLE)
+        ax.legend()
+        if redraw:
+            self.canvas.draw()
+
+    def _plot_bandpass_curve(self, ch, t, y_bp, low_hz=None, high_hz=None, order=None, redraw=True):
+        """Overlay bandpass line for a channel, replacing any prior bandpass curve."""
+        if not self.current_data:
+            return
+        ax = self._get_axis_for_channel(ch)
+        if ax is None:
+            return
+        for ln in list(ax.get_lines()):
+            if str(ln.get_label()).startswith("Bandpass"):
+                try:
+                    ln.remove()
+                except Exception:
+                    pass
+        label = "Bandpass"
+        if low_hz is not None and high_hz is not None:
+            label = f"{label} {low_hz:g}-{high_hz:g} Hz"
+        if order is not None:
+            label = f"{label} ord {order}"
+        ax.plot(t, y_bp, label=label, **BANDPASS_FILTER_STYLE)
         ax.legend()
         if redraw:
             self.canvas.draw()
@@ -2301,6 +2628,21 @@ class OscilloscopeAnalyzer(QMainWindow):
                 continue
             t, y = data
             self._plot_sg_curve(ch, t, y, redraw=False)
+        self.canvas.draw()
+
+    def _redraw_bandpass_overlays(self):
+        """Re-plot stored bandpass overlays for the current event."""
+        if not self.bp_filtered:
+            return
+        for ch, data in self.bp_filtered.items():
+            if not isinstance(data, tuple) or len(data) != 2:
+                continue
+            t, y = data
+            meta = self.bp_filtered_meta.get(ch)
+            low_hz, high_hz, order = (None, None, None)
+            if meta and len(meta) == 3:
+                low_hz, high_hz, order = meta
+            self._plot_bandpass_curve(ch, t, y, low_hz=low_hz, high_hz=high_hz, order=order, redraw=False)
         self.canvas.draw()
 
     def _sg_cache_dir_path(self):
@@ -2384,13 +2726,113 @@ class OscilloscopeAnalyzer(QMainWindow):
             self.canvas.draw()
         return loaded
 
+    def _bp_cache_dir_path(self):
+        return getattr(self, "bp_cache_dir", None)
+
+    def _ensure_bp_cache_dir(self):
+        path = self._bp_cache_dir_path()
+        if not path:
+            return None
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception:
+            return None
+        return path
+
+    def _bp_cache_tag(self, low_hz, high_hz, order):
+        try:
+            low_str = f"{float(low_hz):.6g}"
+        except Exception:
+            low_str = "low"
+        try:
+            high_str = f"{float(high_hz):.6g}"
+        except Exception:
+            high_str = "high"
+        try:
+            order_str = str(int(order))
+        except Exception:
+            order_str = "0"
+        tag = f"low{low_str}_high{high_str}_o{order_str}"
+        return re.sub(r'[^0-9A-Za-z._-]', '_', tag)
+
+    def _bp_cache_filepath(self, evt, ch, low_hz, high_hz, order):
+        base = self._bp_cache_dir_path()
+        if not base:
+            return None
+        safe_evt = re.sub(r'[^0-9A-Za-z_-]', '_', str(evt))
+        tag = self._bp_cache_tag(low_hz, high_hz, order)
+        return os.path.join(base, f"{safe_evt}_ch{ch}_{tag}.npz")
+
+    def _write_bp_cache(self, evt, ch, low_hz, high_hz, order, t, y):
+        if not evt:
+            return False
+        directory = self._ensure_bp_cache_dir()
+        if not directory:
+            return False
+        path = self._bp_cache_filepath(evt, ch, low_hz, high_hz, order)
+        if not path:
+            return False
+        try:
+            np.savez_compressed(
+                path,
+                t=np.asarray(t, dtype=np.float64),
+                y=np.asarray(y, dtype=np.float64),
+            )
+            return True
+        except Exception:
+            return False
+
+    def _load_bp_cache(self, evt, ch, low_hz, high_hz, order):
+        path = self._bp_cache_filepath(evt, ch, low_hz, high_hz, order)
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            data = np.load(path, allow_pickle=False)
+            return np.asarray(data["t"], dtype=np.float64), np.asarray(data["y"], dtype=np.float64)
+        except Exception:
+            return None
+
+    def _delete_bp_cache(self, evt, ch, low_hz, high_hz, order):
+        path = self._bp_cache_filepath(evt, ch, low_hz, high_hz, order)
+        if not path or not os.path.exists(path):
+            return
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+    def _restore_cached_bp(self, evt):
+        """Load cached bandpass data for the current settings and overlay it."""
+        if not evt:
+            return False
+        low_hz = float(self.bp_low.value())
+        high_hz = float(self.bp_high.value())
+        order = int(self.bp_order.value())
+        loaded = False
+        for ch in sorted(self.current_data.keys()):
+            cached = self._load_bp_cache(evt, ch, low_hz, high_hz, order)
+            if cached is None:
+                continue
+            t, y = cached
+            self.bp_filtered[ch] = (t, y)
+            self.bp_filtered_meta[ch] = (low_hz, high_hz, order)
+            self._plot_bandpass_curve(ch, t, y, low_hz=low_hz, high_hz=high_hz, order=order, redraw=False)
+            loaded = True
+        if loaded:
+            self.canvas.draw()
+        return loaded
+
     def plot_waveforms(self):
         self._suspend_axis_capture = True
         try:
             self.figure.clf()
             self._axis_to_channel = {}
+            self._channel_to_axis = {}
             decim = self.decim_spin.value()
-            sorted_chs = sorted(self.current_data.keys())
+            sorted_chs = self._visible_channels()
+            if not sorted_chs:
+                self.canvas.draw()
+                return
             for idx, ch in enumerate(sorted_chs, start=1):
                 ax = self.figure.add_subplot(len(sorted_chs), 1, idx)
                 ax.set_facecolor(self.plot_bg_color)
@@ -2406,6 +2848,7 @@ class OscilloscopeAnalyzer(QMainWindow):
                 for spine in ax.spines.values():
                     spine.set_color(self.fg_color)
                 self._axis_to_channel[ax] = ch
+                self._channel_to_axis[ch] = ax
                 self._apply_saved_axis_limits(ax, ch)
                 sel = SpanSelector(
                     ax,
@@ -2423,7 +2866,9 @@ class OscilloscopeAnalyzer(QMainWindow):
 
     def on_select(self, channel, xmin, xmax):
         self.fit_regions[channel] = (xmin, xmax)
-        ax = self.figure.axes[sorted(self.current_data.keys()).index(channel)]
+        ax = self._get_axis_for_channel(channel)
+        if ax is None:
+            return
         for line in ax.lines:
             if line.get_linestyle() == '--':
                 line.remove()
@@ -2582,6 +3027,96 @@ class OscilloscopeAnalyzer(QMainWindow):
         self._fit_color_index += 1
         self._fit_color_map[key] = fallback_color
         return fallback_color
+
+    def _bandpass(self, t, y, low_hz, high_hz, order=4):
+        t = np.asarray(t, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        dt = np.median(np.diff(t))
+        if not np.isfinite(dt) or dt <= 0:
+            raise ValueError("Invalid sampling interval for bandpass filter.")
+        fs = 1.0 / dt
+        nyq = 0.5 * fs
+        low = low_hz / nyq
+        high = high_hz / nyq
+        if not (0 < low < high < 1):
+            raise ValueError("Cutoffs must satisfy 0 < low < high < Nyquist.")
+        sos = sig.butter(int(order), [low, high], btype='bandpass', output='sos')
+        return sig.sosfiltfilt(sos, y)
+
+    def run_bandpass_filter(self):
+        ch = int(self.bp_ch.currentText())
+        data = self.current_data.get(ch)
+        if data is None:
+            QMessageBox.warning(self, "No Data", f"CH{ch} not loaded.")
+            return
+        t, y, _ = data
+        low_hz = float(self.bp_low.value())
+        high_hz = float(self.bp_high.value())
+        order = int(self.bp_order.value())
+        try:
+            y_bp = self._bandpass(t, y, low_hz, high_hz, order=order)
+        except Exception as e:
+            QMessageBox.warning(self, "Bandpass Error", f"Failed to filter: {e}")
+            return
+        self.bp_filtered[ch] = (t, y_bp)
+        self.bp_filtered_meta[ch] = (low_hz, high_hz, order)
+        self._plot_bandpass_curve(ch, t, y_bp, low_hz=low_hz, high_hz=high_hz, order=order)
+        evt = self.event_combo.currentText()
+        self._write_bp_cache(evt, ch, low_hz, high_hz, order, t, y_bp)
+
+    def show_bandpass_bode(self):
+        ch = int(self.bp_ch.currentText())
+        data = self.current_data.get(ch)
+        if data is None:
+            QMessageBox.warning(self, "No Data", f"CH{ch} not loaded.")
+            return
+        t, _, _ = data
+        t = np.asarray(t, dtype=np.float64)
+        dt = np.median(np.diff(t))
+        if not np.isfinite(dt) or dt <= 0:
+            QMessageBox.warning(self, "Bode Error", "Invalid sampling interval for bandpass.")
+            return
+        fs = 1.0 / dt
+        low_hz = float(self.bp_low.value())
+        high_hz = float(self.bp_high.value())
+        order = int(self.bp_order.value())
+        nyq = 0.5 * fs
+        low = low_hz / nyq
+        high = high_hz / nyq
+        if not (0 < low < high < 1):
+            QMessageBox.warning(self, "Bode Error", "Cutoffs must satisfy 0 < low < high < Nyquist.")
+            return
+        try:
+            sos = sig.butter(int(order), [low, high], btype='bandpass', output='sos')
+            w, h = sig.sosfreqz(sos, worN=2048, fs=fs)
+            mag = 20.0 * np.log10(np.maximum(np.abs(h), 1e-12))
+            phase = np.unwrap(np.angle(h))
+        except Exception as e:
+            QMessageBox.warning(self, "Bode Error", f"Failed to compute response: {e}")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Bandpass Bode • CH{ch}")
+        v = QVBoxLayout(dlg)
+        fig = Figure(figsize=(6, 4))
+        canvas = FigureCanvas(fig)
+        toolbar = NavigationToolbar(canvas, dlg)
+        v.addWidget(toolbar)
+        v.addWidget(canvas)
+        ax_mag = fig.add_subplot(211)
+        ax_phase = fig.add_subplot(212, sharex=ax_mag)
+        ax_mag.semilogx(w, mag, color=BANDPASS_FILTER_COLOR, linewidth=1.2)
+        ax_mag.axvline(low_hz, color="#ef6c00", linestyle="--", linewidth=0.8)
+        ax_mag.axvline(high_hz, color="#ef6c00", linestyle="--", linewidth=0.8)
+        ax_mag.set_ylabel("Magnitude (dB)")
+        ax_mag.grid(True, which="both", alpha=0.3)
+        ax_phase.semilogx(w, phase, color="#5e35b1", linewidth=1.0)
+        ax_phase.set_xlabel("Frequency (Hz)")
+        ax_phase.set_ylabel("Phase (rad)")
+        ax_phase.grid(True, which="both", alpha=0.3)
+        fig.tight_layout()
+        dlg.resize(700, 500)
+        dlg.exec_()
 
     def run_sg_filter(self):
         ch = int(self.sg_ch.currentText()); data = self.current_data.get(ch)
@@ -3057,8 +3592,10 @@ class OscilloscopeAnalyzer(QMainWindow):
         func, names = FIT_LIB[func_name]
         ch = int(self.dyn_ch_combo.currentText())
         region = self.fit_regions.get(ch)
-        # Choose data source: SG if toggle is on and available, else raw
-        if hasattr(self, 'use_sg_toggle') and self.use_sg_toggle.isChecked() and (ch in self.sg_filtered):
+        # Choose data source: bandpass > SG > raw
+        if hasattr(self, 'use_bp_toggle') and self.use_bp_toggle.isChecked() and (ch in self.bp_filtered):
+            t, y = self.bp_filtered[ch]
+        elif hasattr(self, 'use_sg_toggle') and self.use_sg_toggle.isChecked() and (ch in self.sg_filtered):
             t, y = self.sg_filtered[ch]
         else:
             t, y, _ = self.current_data[ch]
@@ -3156,6 +3693,8 @@ class OscilloscopeAnalyzer(QMainWindow):
             val_corr = -val_corr_proc if invert_flag else val_corr_proc
             t_min = None
             value_raw_min = None
+            peak_rel_baseline = None
+            min_rel_baseline = None
             if use_peak_min:
                 idx_min = int(np.argmin(y_f)) if y_f.size else 0
                 t_min = float(t_fit[idx_min]) if len(t_fit) else None
@@ -3165,6 +3704,8 @@ class OscilloscopeAnalyzer(QMainWindow):
                     return
                 val_min = -val_min_proc if invert_flag else val_min_proc
                 value = val_corr - val_min
+                peak_rel_baseline = float(val_corr)
+                min_rel_baseline = float(val_min)
             else:
                 value = val_corr
             baseline_peak = float(baseline_slope * t_fit[idx] + baseline_intercept)
@@ -3173,7 +3714,7 @@ class OscilloscopeAnalyzer(QMainWindow):
                 baseline_min = float(baseline_slope * t_fit[idx_min] + baseline_intercept)
                 value_raw_min = baseline_min + val_min
             # Plot marker on original polarity
-            ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
+            ax = self._get_axis_for_channel(ch)
             # Remove prior marker if any for this selection
             # Build unique key and index
             evt = self.event_combo.currentText()
@@ -3185,20 +3726,23 @@ class OscilloscopeAnalyzer(QMainWindow):
                 key = f"{base}_{idx_num}"
             label = f"{func_name} {idx_num}" if idx_num > 1 else f"{func_name}"
             color = self._resolve_fit_color(func_name)
-            line, = ax.plot([t_peak], [value_raw], marker='o', linestyle='None',
-                             color=color, markeredgecolor=color, markerfacecolor=color,
-                             markersize=6, label=label, zorder=4)
-            line.set_gid(key)
+            line = None
             min_line = None
-            if use_peak_min and t_min is not None and value_raw_min is not None:
-                min_line, = ax.plot([t_min], [value_raw_min], marker='o', linestyle='None',
-                                    color=color, markeredgecolor=color, markerfacecolor='none',
-                                    markersize=5, label="_nolegend_", zorder=4)
-                min_line.set_gid(key)
-            if region is not None:
-                ax.axvline(region[0], color="red", linestyle="--", alpha=0.7)
-                ax.axvline(region[1], color="red", linestyle="--", alpha=0.7)
-            ax.legend(); self.canvas.draw()
+            if ax is not None:
+                line, = ax.plot([t_peak], [value_raw], marker='o', linestyle='None',
+                                 color=color, markeredgecolor=color, markerfacecolor=color,
+                                 markersize=6, label=label, zorder=4)
+                line.set_gid(key)
+                if use_peak_min and t_min is not None and value_raw_min is not None:
+                    min_line, = ax.plot([t_min], [value_raw_min], marker='o', linestyle='None',
+                                        color=color, markeredgecolor=color, markerfacecolor='none',
+                                        markersize=5, label="_nolegend_", zorder=4)
+                    min_line.set_gid(key)
+                if region is not None:
+                    ax.axvline(region[0], color="red", linestyle="--", alpha=0.7)
+                    ax.axvline(region[1], color="red", linestyle="--", alpha=0.7)
+                ax.legend()
+                self.canvas.draw()
             # Store record
             self.results[key] = {
                 "params": (int(w), float(baseline_slope), float(baseline_intercept)),
@@ -3213,6 +3757,9 @@ class OscilloscopeAnalyzer(QMainWindow):
                 "line": line,
                 "min_line": min_line,
             }
+            if use_peak_min and peak_rel_baseline is not None and min_rel_baseline is not None:
+                self.results[key]["peak_rel_baseline"] = float(peak_rel_baseline)
+                self.results[key]["min_rel_baseline"] = float(min_rel_baseline)
             self.fit_info_window.update_info(self.results, self.event_combo.currentText())
             return
 
@@ -3657,6 +4204,10 @@ class OscilloscopeAnalyzer(QMainWindow):
 
         default_sg_window = int(self.sg_win.value()) if hasattr(self, "sg_win") else 201
         use_sg_data = bool(getattr(self, "use_sg_toggle", None) and self.use_sg_toggle.isChecked())
+        use_bp_data = bool(getattr(self, "use_bp_toggle", None) and self.use_bp_toggle.isChecked())
+        bp_low = float(self.bp_low.value()) if hasattr(self, "bp_low") else None
+        bp_high = float(self.bp_high.value()) if hasattr(self, "bp_high") else None
+        bp_order = int(self.bp_order.value()) if hasattr(self, "bp_order") else None
 
         dataset_id = self.dataset_id
         current_event = self.event_combo.currentText()
@@ -3688,14 +4239,25 @@ class OscilloscopeAnalyzer(QMainWindow):
             if ch_path is None:
                 return {"status": "skip", "event": evt_key}
 
+            bp_payload = None
+            if use_bp_data and bp_low is not None and bp_high is not None and bp_order is not None:
+                bp_payload = self._load_bp_cache(evt_key, ch, bp_low, bp_high, bp_order)
+                if bp_payload is None and evt_key == current_event:
+                    if self.bp_filtered_meta.get(ch) == (bp_low, bp_high, bp_order):
+                        bp_payload = self.bp_filtered.get(ch)
+
             sg_payload = None
-            if use_sg_data:
+            if bp_payload is None and use_sg_data:
                 sg_payload = self._load_sg_cache(evt_key, ch, default_sg_window)
                 if sg_payload is None and evt_key == current_event:
                     if self.sg_filtered_meta.get(ch) == default_sg_window:
                         sg_payload = self.sg_filtered.get(ch)
 
-            if sg_payload is not None:
+            if bp_payload is not None:
+                t, y = bp_payload
+                t = np.asarray(t, dtype=np.float64)
+                y = np.asarray(y, dtype=np.float64)
+            elif sg_payload is not None:
                 t, y = sg_payload
                 t = np.asarray(t, dtype=np.float64)
                 y = np.asarray(y, dtype=np.float64)
@@ -3761,8 +4323,12 @@ class OscilloscopeAnalyzer(QMainWindow):
                 if w % 2 == 0:
                     w -= 1
                 y_proc = -y_base_fit if invert_flag else y_base_fit
+                baseline_slope, baseline_intercept = self._fit_baseline_line(t_fit, y_base_fit)
+                baseline_vals = baseline_slope * t_fit + baseline_intercept
+                baseline_proc = -baseline_vals if invert_flag else baseline_vals
+                y_corr = y_proc - baseline_proc
                 try:
-                    y_filtered = sig.savgol_filter(y_proc, w, 2)
+                    y_filtered = sig.savgol_filter(y_corr, w, 2)
                     idx = int(np.argmax(y_filtered)) if y_filtered.size else 0
                     t_peak = float(t_fit[idx]) if t_fit.size else None
                     val_proc = float(y_filtered[idx]) if y_filtered.size else None
@@ -3783,20 +4349,33 @@ class OscilloscopeAnalyzer(QMainWindow):
                         value = val_peak
                 except Exception as err:
                     return {"status": "error", "event": evt_key, "error": err}
+                baseline_peak = float(baseline_slope * t_fit[idx] + baseline_intercept)
+                value_raw = baseline_peak + val_peak
+                value_raw_min = None
+                if use_peak_min:
+                    baseline_min = float(baseline_slope * t_fit[idx_min] + baseline_intercept)
+                    value_raw_min = baseline_min + val_min
 
                 payload = {
                     "status": "ok",
                     "type": func_name,
                     "event": evt_key,
                     "width": int(w),
+                    "baseline_slope": float(baseline_slope),
+                    "baseline_intercept": float(baseline_intercept),
                     "value": float(value),
+                    "value_raw": float(value_raw),
+                    "baseline": float(baseline_peak),
                     "t_peak": float(t_peak),
+                    "peak_rel_baseline": float(val_peak),
                     "fit_region": (float(t0_evt), float(t1_evt)),
                 }
+                if use_peak_min and val_min is not None:
+                    payload["min_rel_baseline"] = float(val_min)
                 if can_plot_current and evt_key == current_event:
-                    payload["plot_point"] = (float(t_peak), float(val_peak))
-                    if use_peak_min and t_min is not None and val_min is not None:
-                        payload["plot_min_point"] = (float(t_min), float(val_min))
+                    payload["plot_point"] = (float(t_peak), float(value_raw))
+                    if use_peak_min and t_min is not None and value_raw_min is not None:
+                        payload["plot_min_point"] = (float(t_min), float(value_raw_min))
                 return payload
 
             try:
@@ -3873,17 +4452,29 @@ class OscilloscopeAnalyzer(QMainWindow):
                 }
 
                 if result["type"] in LOW_PASS_SPECIALS:
+                    use_peak_min = func_name == "low_pass_peak_min"
                     rec.update({
-                        "params": (int(result["width"]),),
-                        "param_names": ["width"],
+                        "params": (int(result["width"]), float(result["baseline_slope"]), float(result["baseline_intercept"])),
+                        "param_names": ["width", "baseline_slope", "baseline_intercept"],
                         "value": float(result["value"]),
+                        "value_raw": float(result["value_raw"]),
+                        "baseline": float(result["baseline"]),
                         "t_at": float(result["t_peak"]),
                     })
+                    if use_peak_min:
+                        if "peak_rel_baseline" in result:
+                            rec["peak_rel_baseline"] = float(result["peak_rel_baseline"])
+                        if "min_rel_baseline" in result:
+                            rec["min_rel_baseline"] = float(result["min_rel_baseline"])
                     if can_plot_current and evt_key == current_event:
-                        ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
+                        ax = self._get_axis_for_channel(ch)
+                        if ax is None:
+                            self.results[key] = rec
+                            added += 1
+                            continue
                         label = f"{func_name} {idx}" if idx > 1 else f"{func_name}"
                         color = self._resolve_fit_color(func_name)
-                        t_peak, val = result.get("plot_point", (result["t_peak"], result["value"]))
+                        t_peak, val = result.get("plot_point", (result["t_peak"], result["value_raw"]))
                         line, = ax.plot(
                             [t_peak],
                             [val],
@@ -3925,21 +4516,27 @@ class OscilloscopeAnalyzer(QMainWindow):
                         rec["param_errors"] = tuple(result["errors"])
                     if func_name == "QD3Fit":
                         try:
-                            charge, mass, rad = QD3Cal(params[1], params[2])
-                            rec.update({"charge": charge, "mass": mass, "radius": rad})
+                            rho = self._get_density_si_for_dataset(dataset_id)
+                            charge, mass, rad = QD3Cal(params[1], params[2], rho=rho)
+                            rec.update({"charge": charge, "mass": mass, "radius": rad, "density": self._get_density_for_dataset(dataset_id)})
                         except Exception:
                             pass
                     elif func_name == "QDMFit":
                         try:
-                            charge, mass, rad = QDMCal(params[1], params[2])
-                            rec.update({"charge": charge, "mass": mass, "radius": rad})
+                            rho = self._get_density_si_for_dataset(dataset_id)
+                            charge, mass, rad = QDMCal(params[1], params[2], rho=rho)
+                            rec.update({"charge": charge, "mass": mass, "radius": rad, "density": self._get_density_for_dataset(dataset_id)})
                         except Exception:
                             pass
 
                     if can_plot_current and evt_key == current_event:
                         t_plot = result.get("plot_t")
                         if t_plot is not None and t_plot.size:
-                            ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
+                            ax = self._get_axis_for_channel(ch)
+                            if ax is None:
+                                self.results[key] = rec
+                                added += 1
+                                continue
                             y_model = func(t_plot, *params)
                             if invert_flag and func_name not in LOW_PASS_SPECIALS:
                                 y_model = -y_model
@@ -4054,16 +4651,31 @@ class OscilloscopeAnalyzer(QMainWindow):
             self.results[key]["param_errors"] = param_errors
 
         if func_name == "QD3Fit":
-            charge, mass, rad = QD3Cal(popt[1], popt[2])
-            self.results[key].update({"charge": charge, "mass": mass, "radius": rad})
+            rho = self._get_density_si_for_dataset(self.dataset_id)
+            charge, mass, rad = QD3Cal(popt[1], popt[2], rho=rho)
+            self.results[key].update({
+                "charge": charge,
+                "mass": mass,
+                "radius": rad,
+                "density": self._get_density_for_dataset(self.dataset_id),
+            })
         elif func_name == "QDMFit":
-            charge, mass, rad = QDMCal(popt[1], popt[2])
-            self.results[key].update({"charge": charge, "mass": mass, "radius": rad})
+            rho = self._get_density_si_for_dataset(self.dataset_id)
+            charge, mass, rad = QDMCal(popt[1], popt[2], rho=rho)
+            self.results[key].update({
+                "charge": charge,
+                "mass": mass,
+                "radius": rad,
+                "density": self._get_density_for_dataset(self.dataset_id),
+            })
 
         y_fit = func_name and FIT_LIB[func_name][0](t_sel, *popt)
         if self.dyn_invert.isChecked():
             y_fit = -y_fit
-        ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
+        ax = self._get_axis_for_channel(ch)
+        if ax is None:
+            self.fit_info_window.update_info(self.results, evt)
+            return
         label = f"{func_name} Fit {idx}" if idx > 1 else f"{func_name} Fit"
         color = self._resolve_fit_color(func_name)
         line, = ax.plot(t_sel, y_fit, color=color, linewidth=FIT_LINE_WIDTH,
@@ -4314,12 +4926,16 @@ class OscilloscopeAnalyzer(QMainWindow):
                 val_corr = -val_corr_proc if invert_flag else val_corr_proc
                 t_min = None
                 value_raw_min = None
+                peak_rel_baseline = None
+                min_rel_baseline = None
                 if use_peak_min:
                     idx_min = int(np.argmin(y_f))
                     t_min = float(t_sel[idx_min])
                     val_min_proc = float(y_f[idx_min])
                     val_min = -val_min_proc if invert_flag else val_min_proc
                     value = val_corr - val_min
+                    peak_rel_baseline = float(val_corr)
+                    min_rel_baseline = float(val_min)
                 else:
                     value = val_corr
                 baseline_peak = float(slope_val * t_sel[idx] + intercept_val)
@@ -4357,6 +4973,9 @@ class OscilloscopeAnalyzer(QMainWindow):
                     "t_min": float(t_min) if t_min is not None else None,
                     "value_raw_min": float(value_raw_min) if value_raw_min is not None else None,
                 }
+                if use_peak_min and peak_rel_baseline is not None and min_rel_baseline is not None:
+                    data["peak_rel_baseline"] = float(peak_rel_baseline)
+                    data["min_rel_baseline"] = float(min_rel_baseline)
                 preview_state["ok"] = True
                 preview_state["data"] = data
                 _update_metrics(data)
@@ -4387,44 +5006,48 @@ class OscilloscopeAnalyzer(QMainWindow):
             baseline_peak = float(data["baseline"])
             t_min = data.get("t_min")
             value_raw_min = data.get("value_raw_min")
+            peak_rel_baseline = data.get("peak_rel_baseline")
+            min_rel_baseline = data.get("min_rel_baseline")
 
-            ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
+            ax = self._get_axis_for_channel(ch)
             line = rec.get("line")
             color = self._resolve_fit_color(func_name)
-            if line in ax.lines:
-                line.set_marker('o')
-                line.set_linestyle('None')
-                line.set_color(color)
-                line.set_markerfacecolor(color)
-                line.set_markeredgecolor(color)
-                line.set_data([t_peak], [value_raw])
-                new_line = line
-            else:
-                idx_match = re.search(r"_(\d+)$", key)
-                suffix = idx_match.group(1) if idx_match else ""
-                label = f"{func_name} {suffix}".strip()
-                new_line, = ax.plot([t_peak], [value_raw], marker='o', linestyle='None',
-                                     color=color, markeredgecolor=color, markerfacecolor=color,
-                                     markersize=6, label=label, zorder=4)
-                new_line.set_gid(key)
+            new_line = None
             min_line = rec.get("min_line")
             new_min_line = None
-            if use_peak_min and t_min is not None and value_raw_min is not None:
-                if min_line in ax.lines:
-                    min_line.set_marker('o')
-                    min_line.set_linestyle('None')
-                    min_line.set_color(color)
-                    min_line.set_markerfacecolor('none')
-                    min_line.set_markeredgecolor(color)
-                    min_line.set_data([t_min], [value_raw_min])
-                    new_min_line = min_line
+            if ax is not None:
+                if line in ax.lines:
+                    line.set_marker('o')
+                    line.set_linestyle('None')
+                    line.set_color(color)
+                    line.set_markerfacecolor(color)
+                    line.set_markeredgecolor(color)
+                    line.set_data([t_peak], [value_raw])
+                    new_line = line
                 else:
-                    new_min_line, = ax.plot([t_min], [value_raw_min], marker='o', linestyle='None',
-                                             color=color, markeredgecolor=color, markerfacecolor='none',
-                                             markersize=5, label="_nolegend_", zorder=4)
-                    new_min_line.set_gid(key)
-            elif min_line in ax.lines:
-                min_line.remove()
+                    idx_match = re.search(r"_(\d+)$", key)
+                    suffix = idx_match.group(1) if idx_match else ""
+                    label = f"{func_name} {suffix}".strip()
+                    new_line, = ax.plot([t_peak], [value_raw], marker='o', linestyle='None',
+                                         color=color, markeredgecolor=color, markerfacecolor=color,
+                                         markersize=6, label=label, zorder=4)
+                    new_line.set_gid(key)
+                if use_peak_min and t_min is not None and value_raw_min is not None:
+                    if min_line in ax.lines:
+                        min_line.set_marker('o')
+                        min_line.set_linestyle('None')
+                        min_line.set_color(color)
+                        min_line.set_markerfacecolor('none')
+                        min_line.set_markeredgecolor(color)
+                        min_line.set_data([t_min], [value_raw_min])
+                        new_min_line = min_line
+                    else:
+                        new_min_line, = ax.plot([t_min], [value_raw_min], marker='o', linestyle='None',
+                                                 color=color, markeredgecolor=color, markerfacecolor='none',
+                                                 markersize=5, label="_nolegend_", zorder=4)
+                        new_min_line.set_gid(key)
+                elif min_line in ax.lines:
+                    min_line.remove()
             rec.update({
                 "params": (int(w), float(slope_val), float(intercept_val)),
                 "param_names": ["width", "baseline_slope", "baseline_intercept"],
@@ -4437,21 +5060,27 @@ class OscilloscopeAnalyzer(QMainWindow):
                 "dataset_id": rec.get("dataset_id", self.dataset_id),
                 "inverted": invert_flag,
             })
+            if use_peak_min and peak_rel_baseline is not None and min_rel_baseline is not None:
+                rec["peak_rel_baseline"] = float(peak_rel_baseline)
+                rec["min_rel_baseline"] = float(min_rel_baseline)
             if new_min_line is not None:
                 rec["min_line"] = new_min_line
             else:
                 rec.pop("min_line", None)
             rec.pop("param_errors", None)
-            ax.legend()
-            self.canvas.draw()
+            if ax is not None:
+                ax.legend()
+                self.canvas.draw()
             self.fit_info_window.update_info(self.results, evt)
             return
         names = rec["param_names"]
         params = rec["params"]
         func, _ = FIT_LIB[func_name]
         region = self.fit_regions.get(ch) or rec.get("fit_region")
-        # Choose data source for adjustment preview: SG if toggle is on and available
-        if hasattr(self, 'use_sg_toggle') and self.use_sg_toggle.isChecked() and (ch in self.sg_filtered):
+        # Choose data source for adjustment preview: bandpass > SG > raw
+        if hasattr(self, 'use_bp_toggle') and self.use_bp_toggle.isChecked() and (ch in self.bp_filtered):
+            t, y = self.bp_filtered[ch]
+        elif hasattr(self, 'use_sg_toggle') and self.use_sg_toggle.isChecked() and (ch in self.sg_filtered):
             t, y = self.sg_filtered[ch]
         else:
             t, y, _ = self.current_data[ch]
@@ -4462,7 +5091,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         guess, lower, upper = self._guess_params(func_name, names, t_sel, y_sel)
         bounds = (lower, upper) if any(np.isfinite(lower)) or any(np.isfinite(upper)) else None
         dlg = SciFitParamsDialog({n: p for n, p in zip(names, params)}, func, t_sel, y_sel, names, bounds, parent=self)
-        ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
+        ax = self._get_axis_for_channel(ch)
         line = rec.get("line")
         orig_params = params
         orig_inverted = rec.get("inverted", False)
@@ -4470,6 +5099,8 @@ class OscilloscopeAnalyzer(QMainWindow):
 
         def plot_current(param_dict):
             nonlocal line
+            if ax is None:
+                return
             new_params = [param_dict[n] for n in names]
             y_fit = func(t_sel, *new_params)
             if invert_flag:
@@ -4509,19 +5140,33 @@ class OscilloscopeAnalyzer(QMainWindow):
             else:
                 rec.pop("param_errors", None)
             if func_name == "QD3Fit":
-                charge, mass, rad = QD3Cal(params_dict["q"], params_dict["v"])
-                rec.update({"charge": charge, "mass": mass, "radius": rad})
+                rho = self._get_density_si_for_dataset(rec.get("dataset_id", self.dataset_id))
+                charge, mass, rad = QD3Cal(params_dict["q"], params_dict["v"], rho=rho)
+                rec.update({
+                    "charge": charge,
+                    "mass": mass,
+                    "radius": rad,
+                    "density": self._get_density_for_dataset(rec.get("dataset_id", self.dataset_id)),
+                })
             elif func_name == "QDMFit":
-                charge, mass, rad = QDMCal(params_dict["q"], params_dict["v"])
-                rec.update({"charge": charge, "mass": mass, "radius": rad})
-            ax.legend()
-            self.canvas.draw()
+                rho = self._get_density_si_for_dataset(rec.get("dataset_id", self.dataset_id))
+                charge, mass, rad = QDMCal(params_dict["q"], params_dict["v"], rho=rho)
+                rec.update({
+                    "charge": charge,
+                    "mass": mass,
+                    "radius": rad,
+                    "density": self._get_density_for_dataset(rec.get("dataset_id", self.dataset_id)),
+                })
+            if ax is not None:
+                ax.legend()
+                self.canvas.draw()
             self.fit_info_window.update_info(self.results, evt)
         else:
             invert_flag = orig_inverted
             plot_current({n: v for n, v in zip(names, orig_params)})
             rec["line"] = line
-            self.canvas.draw()
+            if ax is not None:
+                self.canvas.draw()
 
     def clear_dynamic_fit(self):
         func_name = self.dyn_func_combo.currentText()
@@ -4531,15 +5176,16 @@ class OscilloscopeAnalyzer(QMainWindow):
         if key is None:
             return
         rec = self.results.pop(key)
-        ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
+        ax = self._get_axis_for_channel(ch)
         line = rec.get("line")
-        if line in ax.lines:
+        if ax is not None and line in ax.lines:
             line.remove()
         min_line = rec.get("min_line")
-        if min_line in ax.lines:
+        if ax is not None and min_line in ax.lines:
             min_line.remove()
-        ax.legend()
-        self.canvas.draw()
+        if ax is not None:
+            ax.legend()
+            self.canvas.draw()
         self.fit_info_window.update_info(self.results, self.event_combo.currentText())
 
     def clear_channel_fits(self):
@@ -4586,7 +5232,12 @@ class OscilloscopeAnalyzer(QMainWindow):
         else:
             t_sel, y_sel = t, y
         inverted = rec.get("inverted", False)
-        ax = self.figure.axes[sorted(self.current_data.keys()).index(ch)]
+        ax = self._get_axis_for_channel(ch)
+        if ax is None:
+            rec.pop("line", None)
+            rec.pop("min_line", None)
+            self.results[key] = rec
+            return
         # Special handling for low-pass extrema
         if func_name in LOW_PASS_SPECIALS:
             use_peak_min = func_name == "low_pass_peak_min"
@@ -4629,6 +5280,8 @@ class OscilloscopeAnalyzer(QMainWindow):
                             return
                         val_min = -val_min_proc if inverted else val_min_proc
                         value = val_corr - val_min
+                        rec.setdefault("peak_rel_baseline", float(val_corr))
+                        rec.setdefault("min_rel_baseline", float(val_min))
                     else:
                         value = val_corr
                     baseline_peak = float(baseline_slope * t_sel[i] + baseline_intercept)
@@ -4648,6 +5301,12 @@ class OscilloscopeAnalyzer(QMainWindow):
                 if t_min is None or val_min_proc is None:
                     return
                 val_min = -val_min_proc if inverted else val_min_proc
+                if "peak_rel_baseline" not in rec:
+                    val_corr_proc = float(np.max(y_f)) if y_f.size else None
+                    if val_corr_proc is not None:
+                        val_corr = -val_corr_proc if inverted else val_corr_proc
+                        rec["peak_rel_baseline"] = float(val_corr)
+                rec.setdefault("min_rel_baseline", float(val_min))
                 baseline_min = float(baseline_slope * t_sel[i_min] + baseline_intercept)
                 value_raw_min = baseline_min + val_min
             line = rec.get("line")
@@ -4722,6 +5381,9 @@ class OscilloscopeAnalyzer(QMainWindow):
                 qdf = self._build_quality_dataframe()
                 if qdf is not None and not qdf.empty:
                     store['quality'] = qdf
+                ds_info = self._build_dataset_info_dataframe()
+                if ds_info is not None and not ds_info.empty:
+                    store['dataset_info'] = ds_info
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to export fits:\n{e}")
             return
@@ -4759,7 +5421,8 @@ class OscilloscopeAnalyzer(QMainWindow):
                 continue
             event, fit_type, ch_str = m.groups()
             ch = int(ch_str)
-            row = {'event': event, 'channel': ch, 'fit_type': fit_type, 'dataset_id': rec.get('dataset_id')}
+            ds_id = rec.get('dataset_id')
+            row = {'event': event, 'channel': ch, 'fit_type': fit_type, 'dataset_id': ds_id}
             params = rec.get('params', ())
             param_names = list(rec.get('param_names', [f'p{i}' for i in range(len(params))]))
             ft = fit_type.lower()
@@ -4820,8 +5483,15 @@ class OscilloscopeAnalyzer(QMainWindow):
                     row['baseline'] = rec['baseline']
                 if 't_at' in rec:
                     row['t_at'] = rec['t_at']
+                if 'peak_rel_baseline' in rec:
+                    row['peak_rel_baseline'] = rec['peak_rel_baseline']
+                if 'min_rel_baseline' in rec:
+                    row['min_rel_baseline'] = rec['min_rel_baseline']
             # Persist inverted flag for round-trip accuracy
             row['inverted'] = bool(rec.get('inverted', False))
+        density_val = self._get_density_for_dataset(ds_id)
+        if density_val is not None:
+            row['density'] = density_val
             fit_region = rec.get('fit_region')
             if isinstance(fit_region, (tuple, list)) and len(fit_region) == 2:
                 try:
@@ -4832,6 +5502,58 @@ class OscilloscopeAnalyzer(QMainWindow):
             _append_param_errors(row, param_names, rec)
             records.append(row)
         return pd.DataFrame.from_records(records)
+
+    def _build_dataset_info_dataframe(self):
+        rows = []
+        for ds, density in (self.dataset_densities or {}).items():
+            if not ds:
+                continue
+            try:
+                val = float(density)
+            except Exception:
+                continue
+            rows.append({'dataset_id': ds, 'density': val})
+        cur_ds = getattr(self, 'dataset_id', None)
+        if cur_ds:
+            try:
+                cur_val = float(self.density_spin.value())
+            except Exception:
+                cur_val = None
+            if cur_val is not None and not any(r['dataset_id'] == cur_ds for r in rows):
+                rows.append({'dataset_id': cur_ds, 'density': cur_val})
+        if not rows:
+            return pd.DataFrame(columns=['dataset_id', 'density'])
+        return pd.DataFrame.from_records(rows)
+
+    def _get_density_for_dataset(self, dataset_id, fallback=7.5):
+        """Return density in g/cc for a dataset, with a sensible fallback."""
+        if not dataset_id:
+            return fallback
+        if dataset_id in self.dataset_densities:
+            try:
+                val = float(self.dataset_densities[dataset_id])
+            except Exception:
+                val = None
+        else:
+            val = None
+        if val is None:
+            cur_ds = getattr(self, 'dataset_id', None)
+            if cur_ds and str(cur_ds) == str(dataset_id):
+                try:
+                    val = float(self.density_spin.value())
+                except Exception:
+                    val = None
+        if val is None or not np.isfinite(val) or val <= 0:
+            return fallback
+        return float(val)
+
+    def _get_density_si_for_dataset(self, dataset_id, fallback=7.5):
+        """Return density in kg/m^3 for a dataset (from g/cc)."""
+        gcc = self._get_density_for_dataset(dataset_id, fallback=fallback)
+        try:
+            return float(gcc) * 1000.0
+        except Exception:
+            return float(fallback) * 1000.0
 
     def _build_quality_dataframe(self):
         rows = []
@@ -4924,6 +5646,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         if not path:
             return
         quality_df = None
+        dataset_info_df = None
         try:
             with pd.HDFStore(path) as store:
                 ks = set(store.keys())
@@ -4940,6 +5663,12 @@ class OscilloscopeAnalyzer(QMainWindow):
                         quality_df = store[qkey]
                     except Exception:
                         quality_df = None
+                dkey = '/dataset_info' if '/dataset_info' in ks else ('dataset_info' if 'dataset_info' in ks else None)
+                if dkey:
+                    try:
+                        dataset_info_df = store[dkey]
+                    except Exception:
+                        dataset_info_df = None
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load fits:\n{e}")
             return
@@ -5071,9 +5800,9 @@ class OscilloscopeAnalyzer(QMainWindow):
             if names is None:
                 # Generic: collect numeric columns that are not meta
                 meta_cols = {
-                    'event','channel','fit_type','dataset_id','impact_time','charge','mass','radius',
+                    'event','channel','fit_type','dataset_id','density','impact_time','charge','mass','radius',
                     'region_start','region_end','fit_region_start','fit_region_end','fit_region_min','fit_region_max',
-                    'fit_tmin','fit_tmax','value','value_raw','baseline','t_at','inverted'
+                    'fit_tmin','fit_tmax','value','value_raw','baseline','t_at','peak_rel_baseline','min_rel_baseline','inverted'
                 }
                 param_candidates = [
                     c for c in df.columns
@@ -5131,6 +5860,10 @@ class OscilloscopeAnalyzer(QMainWindow):
                 rec['baseline'] = float(row['baseline'])
             if 't_at' in row and _is_num(row['t_at']):
                 rec['t_at'] = float(row['t_at'])
+            if 'peak_rel_baseline' in row and _is_num(row['peak_rel_baseline']):
+                rec['peak_rel_baseline'] = float(row['peak_rel_baseline'])
+            if 'min_rel_baseline' in row and _is_num(row['min_rel_baseline']):
+                rec['min_rel_baseline'] = float(row['min_rel_baseline'])
             region = _extract_region(row)
             if region is not None:
                 rec['fit_region'] = region
@@ -5171,6 +5904,24 @@ class OscilloscopeAnalyzer(QMainWindow):
                     self.event_quality[evt_norm] = rating_int
             self._sync_quality_spin(self.event_combo.currentText())
 
+        if dataset_info_df is not None and len(dataset_info_df):
+            for _, row in dataset_info_df.iterrows():
+                ds_val = row.get('dataset_id')
+                if ds_val is None:
+                    continue
+                dens = row.get('density')
+                if dens is None:
+                    continue
+                try:
+                    dens_val = float(dens)
+                except Exception:
+                    continue
+                self.dataset_densities[ds_val] = dens_val
+            # Refresh current dataset density if present
+            cur_ds = getattr(self, 'dataset_id', None)
+            if cur_ds in self.dataset_densities:
+                self._sync_density_spin(cur_ds)
+
         # If a current event is visible, redraw overlays from imported fits that match dataset
         evt = self.event_combo.currentText()
         if evt:
@@ -5190,22 +5941,40 @@ class OscilloscopeAnalyzer(QMainWindow):
         ch = int(self.sg_ch.currentText())
         self.sg_filtered.pop(ch, None)
         width = self.sg_filtered_meta.pop(ch, None)
-        sorted_chs = sorted(self.current_data.keys())
-        if ch in sorted_chs:
-            idx = sorted_chs.index(ch)
-            if idx < len(self.figure.axes):
-                ax = self.figure.axes[idx]
-                for line in list(ax.lines):
-                    if line.get_label() == 'SG Filter':
-                        try:
-                            line.remove()
-                        except Exception:
-                            pass
-                ax.legend()
+        ax = self._get_axis_for_channel(ch)
+        if ax is not None:
+            for line in list(ax.lines):
+                if line.get_label() == 'SG Filter':
+                    try:
+                        line.remove()
+                    except Exception:
+                        pass
+            ax.legend()
         self.canvas.draw()
         evt = self.event_combo.currentText()
         if evt and width:
             self._delete_sg_cache(evt, ch, width)
+
+    def clear_bandpass_filter(self):
+        if not self.current_data:
+            return
+        ch = int(self.bp_ch.currentText())
+        meta = self.bp_filtered_meta.pop(ch, None)
+        self.bp_filtered.pop(ch, None)
+        ax = self._get_axis_for_channel(ch)
+        if ax is not None:
+            for line in list(ax.lines):
+                if str(line.get_label()).startswith("Bandpass"):
+                    try:
+                        line.remove()
+                    except Exception:
+                        pass
+            ax.legend()
+        self.canvas.draw()
+        evt = self.event_combo.currentText()
+        if evt and meta and len(meta) == 3:
+            low_hz, high_hz, order = meta
+            self._delete_bp_cache(evt, ch, low_hz, high_hz, order)
 
     def save_figure_transparent(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -5248,11 +6017,25 @@ class OscilloscopeAnalyzer(QMainWindow):
         # Drop SG overlays stored in memory
         self.sg_filtered.clear()
         self.sg_filtered_meta.clear()
+        # Drop bandpass overlays stored in memory
+        self.bp_filtered.clear()
+        self.bp_filtered_meta.clear()
         # Remove cached SG files so overlays do not restore on event changes
         cache_dir = self._sg_cache_dir_path()
         if cache_dir and os.path.isdir(cache_dir):
             for name in os.listdir(cache_dir):
                 path = os.path.join(cache_dir, name)
+                if not os.path.isfile(path):
+                    continue
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+        # Remove cached BP files so overlays do not restore on event changes
+        bp_cache_dir = self._bp_cache_dir_path()
+        if bp_cache_dir and os.path.isdir(bp_cache_dir):
+            for name in os.listdir(bp_cache_dir):
+                path = os.path.join(bp_cache_dir, name)
                 if not os.path.isfile(path):
                     continue
                 try:
@@ -5266,6 +6049,7 @@ class OscilloscopeAnalyzer(QMainWindow):
                 if ln.get_linestyle() == '-.'
                 or str(ln.get_label()).endswith('Fit')
                 or ln.get_label() == 'SG Filter'
+                or str(ln.get_label()).startswith('Bandpass')
             ]
             for ln in lines_to_remove:
                 ax.lines.remove(ln)
@@ -5638,6 +6422,10 @@ class OscilloscopeAnalyzer(QMainWindow):
             "• SG Filter (S): Run Savitzky-Golay filtering on the selected channel.\n"
             "• Batch Run: Run SG filtering across a range of events (Ctrl+B).\n"
             "• Clear Fit: Remove the SG overlay for the current event/channel (Shift+S).\n"
+            "Bandpass row:\n"
+            "• Bandpass: Apply a Butterworth bandpass filter overlay for the selected channel.\n"
+            "• Clear BP: Remove the bandpass overlay for the current channel.\n"
+            "• Bode: Show the bandpass frequency response.\n"
             "• Preserve Axes: Select which channels keep their zoom/pan across events.\n"
             "• Results Plotter (P): Open the dataset-level results visualization window.\n"
             "• Feature Scan: Search events for large excursions vs. robust sigma; optional detrend (Ctrl+F).\n"
@@ -5652,7 +6440,8 @@ class OscilloscopeAnalyzer(QMainWindow):
             "• Batch Run (B): Run the selected fit across multiple events (time window or impact-centered).\n"
             "Toggles:\n"
             "• Invert (I): Invert polarity for fitting (also flips low_pass_max/low_pass_peak_min extremum).\n"
-            "• Use SG (Ctrl+Shift+S): Use SG-filtered data for fits/FFT when available.\n\n"
+            "• Use SG (Ctrl+Shift+S): Use SG-filtered data for fits/FFT when available.\n"
+            "• Use BP: Use bandpass-filtered data for fits/FFT when available (current event only).\n\n"
             "Notes:\n"
             "• Fits run on raw data by default; QD3/QDM use SG only for initial parameter guessing.\n"
             "• SG Batch runs multi-threaded and caches filtered traces (per channel + window) for rapid recall; clearing SG removes the cached trace for that channel/event.\n"
@@ -5665,7 +6454,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             "  Navigation:  , / .  (Prev/Next),  T (Mark Impact)\n"
             "  Files:       F (Select Folder),  Ctrl+S (Save),  Ctrl+E (Export),  Ctrl+I (Load),  Shift+D (Clear Data)\n"
             "  Meta:        L (Load Metadata),  M (MetaMatch)\n"
-            "  SG/Filters:  S (SG),  Ctrl+B (SG Batch),  Shift+S (Clear SG),  P (Results Plotter),  Ctrl+F (Feature Scan),  Ctrl+Shift+F (Fit Filter),  Ctrl+K (Clear Filter)\n"
+            "  SG/Filters:  S (SG),  Ctrl+B (SG Batch),  Shift+S (Clear SG),  Shift+B (Bandpass),  P (Results Plotter),  Ctrl+F (Feature Scan),  Ctrl+Shift+F (Fit Filter),  Ctrl+K (Clear Filter)\n"
             "  Dynamic:     Enter (Run),  A (Adjust),  R (Clear Fit),  Shift+R (Clear Chan Fits),  B (Batch),  Ctrl+Shift+S (Toggle Use SG)\n"
             "               Q/D/C/W/G/X/Z selects QD3/QDM/CSA/skew/gauss/low_pass_max/low_pass_peak_min; 1-8 selects channel; I toggles invert.\n"
             "  Info:        H (Help),  U (Fit Info),  Ctrl+T (Theme)\n"
