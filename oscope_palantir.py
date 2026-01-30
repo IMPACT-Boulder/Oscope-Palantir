@@ -702,6 +702,64 @@ class SGBatchDialog(QDialog):
         return ev0, ev1, self.overwrite_chk.isChecked(), int(self.thread_spin.value())
 
 
+class BPBatchDialog(QDialog):
+    """Configuration dialog for running bandpass filtering across multiple events."""
+
+    def __init__(self, parent, evt_min, evt_max, default_threads=1, max_threads=None):
+        super().__init__(parent)
+        self.setWindowTitle("Bandpass Batch Configuration")
+
+        layout = QVBoxLayout(self)
+        grid = QGridLayout()
+        layout.addLayout(grid)
+
+        grid.addWidget(QLabel("Start Event"), 0, 0)
+        self.start_evt = QLineEdit(str(evt_min))
+        grid.addWidget(self.start_evt, 0, 1)
+
+        grid.addWidget(QLabel("End Event"), 1, 0)
+        self.end_evt = QLineEdit(str(evt_max))
+        grid.addWidget(self.end_evt, 1, 1)
+
+        self.overwrite_chk = QCheckBox("Overwrite cached filters")
+        self.overwrite_chk.setToolTip("When unchecked, skip events that already have cached bandpass data")
+        layout.addWidget(self.overwrite_chk)
+
+        grid_threads = QGridLayout()
+        layout.addLayout(grid_threads)
+        grid_threads.addWidget(QLabel("Worker Threads"), 0, 0)
+        self.thread_spin = QSpinBox()
+        max_threads = max_threads or max(1, os.cpu_count() or 1)
+        self.thread_spin.setRange(1, max_threads)
+        try:
+            default_threads = int(default_threads)
+        except Exception:
+            default_threads = 1
+        default_threads = max(1, min(default_threads, max_threads))
+        self.thread_spin.setValue(default_threads)
+        self.thread_spin.setToolTip("Number of parallel workers for bandpass filtering")
+        grid_threads.addWidget(self.thread_spin, 0, 1)
+
+        note = QLabel("Uses the Bandpass channel + low/high cutoffs + order configured on the main toolbar.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def values(self):
+        try:
+            ev0 = int(self.start_evt.text().strip())
+            ev1 = int(self.end_evt.text().strip())
+        except Exception:
+            raise ValueError("Invalid event range")
+        if ev1 < ev0:
+            raise ValueError("End Event must be >= Start Event")
+        return ev0, ev1, self.overwrite_chk.isChecked(), int(self.thread_spin.value())
+
+
 class WaveformCoaddDialog(QDialog):
     """Configuration dialog for combining multiple waveforms."""
 
@@ -1161,6 +1219,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self._child_windows  = []  # keep references to child windows (e.g., Results Plotter)
         cpu_threads = max(1, os.cpu_count() or 1)
         self._sg_batch_thread_count = min(4, cpu_threads)
+        self._bp_batch_thread_count = min(4, cpu_threads)
         self._axis_to_channel = {}
         self._channel_to_axis = {}
         self._axis_event_ids = []
@@ -1591,6 +1650,14 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.bp_order.setMaximumHeight(btn_height)
         bp_layout.addWidget(wrap_control("Order:", self.bp_order))
 
+        self.btn_batch_bp = QPushButton("Batch Run")
+        self.btn_batch_bp.setIcon(qta.icon('fa5s.play', color=self.accent))
+        self.btn_batch_bp.setToolTip("Run bandpass filter on all events")
+        self.btn_batch_bp.clicked.connect(self.run_batch_bp_filter)
+        self.btn_batch_bp.setFixedWidth(self.unit_width)
+        self.btn_batch_bp.setMaximumHeight(btn_height)
+        bp_layout.addWidget(self.btn_batch_bp)
+
         self.btn_clear_bp = QPushButton("Clear BP")
         self.btn_clear_bp.setIcon(qta.icon('fa5s.times', color=self.accent))
         self.btn_clear_bp.setToolTip("Remove bandpass overlay for current channel")
@@ -1741,7 +1808,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             self.btn_clear_data, self.btn_show_info,
             self.btn_sg, self.sg_ch, self.sg_win,
             self.btn_batch_sg, self.btn_clear_sg, self.preserve_axes_button, self.btn_results_plotter, self.btn_feature_scan, self.btn_fit_filter, self.btn_quality_filter, self.btn_clear_filter,
-            self.btn_bandpass, self.bp_ch, self.bp_low, self.bp_high, self.bp_order, self.btn_clear_bp, self.btn_bp_bode,
+            self.btn_bandpass, self.bp_ch, self.bp_low, self.bp_high, self.bp_order, self.btn_batch_bp, self.btn_clear_bp, self.btn_bp_bode,
             self.channel_visibility_button,
             self.dyn_func_combo, self.btn_dyn, self.btn_batch_dyn, self.dyn_ch_combo,
             self.dyn_invert, self.dyn_decim_spin, self.use_sg_toggle, self.use_bp_toggle, self.btn_adjust_dyn, self.btn_clear_dyn, self.btn_clear_chan
@@ -2763,6 +2830,10 @@ class OscilloscopeAnalyzer(QMainWindow):
         tag = self._bp_cache_tag(low_hz, high_hz, order)
         return os.path.join(base, f"{safe_evt}_ch{ch}_{tag}.npz")
 
+    def _bp_cache_exists(self, evt, ch, low_hz, high_hz, order):
+        path = self._bp_cache_filepath(evt, ch, low_hz, high_hz, order)
+        return bool(path and os.path.exists(path))
+
     def _write_bp_cache(self, evt, ch, low_hz, high_hz, order, t, y):
         if not evt:
             return False
@@ -3329,6 +3400,169 @@ class OscilloscopeAnalyzer(QMainWindow):
                 preview += f"\n... ({len(errors) - 5} more)"
             QMessageBox.warning(self, "Batch Errors", f"Some events could not be processed:\n{preview}")
 
+    def run_batch_bp_filter(self):
+        """Run bandpass filtering across a range of events and cache the results."""
+        if not getattr(self, "event_files", None):
+            QMessageBox.warning(self, "No Folder", "Select a folder with TRC files first.")
+            return
+        ch = int(self.bp_ch.currentText())
+        low_hz = float(self.bp_low.value())
+        high_hz = float(self.bp_high.value())
+        order = int(self.bp_order.value())
+
+        ev_pairs = []
+        for i in range(self.event_combo.count()):
+            key = self.event_combo.itemText(i)
+            try:
+                iv = int(key)
+            except Exception:
+                m = re.search(r"(\d+)$", key)
+                if not m:
+                    continue
+                iv = int(m.group(1))
+            ev_pairs.append((iv, key))
+        if not ev_pairs:
+            QMessageBox.warning(self, "No Events", "No events available for batch filtering.")
+            return
+        ev_pairs.sort(key=lambda x: x[0])
+        evt_min = ev_pairs[0][0]
+        evt_max = ev_pairs[-1][0]
+
+        max_threads = max(1, os.cpu_count() or 1)
+        default_threads = getattr(self, "_bp_batch_thread_count", min(4, max_threads))
+        dlg = BPBatchDialog(self, evt_min, evt_max, default_threads=default_threads, max_threads=max_threads)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        try:
+            ev0, ev1, overwrite, thread_count = dlg.values()
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid Input", str(e))
+            return
+
+        thread_count = max(1, min(thread_count, max_threads))
+        self._bp_batch_thread_count = thread_count
+
+        targets = [key for (iv, key) in ev_pairs if ev0 <= iv <= ev1]
+        if not targets:
+            QMessageBox.information(self, "No Events", "No events in the specified range.")
+            return
+
+        if not self._ensure_bp_cache_dir():
+            QMessageBox.warning(self, "Cache Unavailable", "Unable to create BP cache directory in the selected folder.")
+            return
+
+        skipped_existing = skipped_missing = 0
+        job_list = []
+        for evt in targets:
+            if not overwrite and self._bp_cache_exists(evt, ch, low_hz, high_hz, order):
+                skipped_existing += 1
+                continue
+            ch_path = None
+            for path in self.event_files.get(evt, []):
+                if re.match(fr"C{ch}", os.path.basename(path) or ""):
+                    ch_path = path
+                    break
+            if not ch_path:
+                skipped_missing += 1
+                continue
+            job_list.append((evt, ch_path))
+
+        if not job_list:
+            summary = [
+                f"No events required BP filtering for CH{ch} ({low_hz:g}-{high_hz:g} Hz, order {order}).",
+            ]
+            if skipped_existing:
+                summary.append(f"Skipped existing cache: {skipped_existing}")
+            if skipped_missing:
+                summary.append(f"No channel file: {skipped_missing}")
+            QMessageBox.information(self, "Batch BP Filter", "\n".join(summary))
+            return
+
+        cancel_event = threading.Event()
+        prog = QProgressDialog("Batch bandpass filtering...", "Cancel", 0, len(job_list), self)
+        prog.setWindowModality(Qt.ApplicationModal)
+        prog.setAutoClose(True)
+        prog.show()
+
+        processed = 0
+        errors = []
+        current_payload = None
+
+        def _batch_worker(evt_key, ch_path):
+            if cancel_event.is_set():
+                return {"status": "cancelled", "event": evt_key}
+            try:
+                trc_reader = Trc()
+                t, y, _ = trc_reader.open(ch_path)
+                t = np.asarray(t, dtype=np.float64)
+                y = np.asarray(y, dtype=np.float64)
+                y_bp = self._bandpass(t, y, low_hz, high_hz, order=order)
+            except Exception as err:
+                return {"status": "error", "event": evt_key, "error": err}
+            if cancel_event.is_set():
+                return {"status": "cancelled", "event": evt_key}
+            self._write_bp_cache(evt_key, ch, low_hz, high_hz, order, t, y_bp)
+            return {"status": "ok", "event": evt_key, "t": t, "y": y_bp}
+
+        executor = ThreadPoolExecutor(max_workers=thread_count)
+        futures = []
+        try:
+            for evt_key, ch_path in job_list:
+                futures.append(executor.submit(_batch_worker, evt_key, ch_path))
+            for idx, fut in enumerate(as_completed(futures), start=1):
+                if prog.wasCanceled():
+                    cancel_event.set()
+                result = None
+                try:
+                    result = fut.result()
+                except Exception as err:
+                    result = {"status": "error", "event": "?", "error": err}
+                status = result.get("status")
+                evt = result.get("event")
+                if status == "ok":
+                    processed += 1
+                    if "t" in result and result["t"] is not None and evt == self.event_combo.currentText():
+                        current_payload = (result["t"], result["y"])
+                elif status == "error":
+                    err = result.get("error")
+                    errors.append(f"{evt}: {err}" if err is not None else f"{evt}: Unknown error")
+                if cancel_event.is_set():
+                    break
+                prog.setValue(idx)
+        finally:
+            cancel_event.set()
+            for fut in futures:
+                fut.cancel()
+            executor.shutdown(wait=False)
+
+        prog.setValue(len(job_list))
+        prog.close()
+
+        if current_payload:
+            self.bp_filtered[ch] = current_payload
+            self.bp_filtered_meta[ch] = (low_hz, high_hz, order)
+            self._plot_bandpass_curve(ch, *current_payload, low_hz=low_hz, high_hz=high_hz, order=order)
+
+        summary = [
+            f"BP batch complete for CH{ch} ({low_hz:g}-{high_hz:g} Hz, order {order}).",
+            f"Processed: {processed}",
+            f"Threads used: {thread_count}",
+        ]
+        if skipped_existing:
+            summary.append(f"Skipped existing cache: {skipped_existing}")
+        if skipped_missing:
+            summary.append(f"No channel file: {skipped_missing}")
+        if prog.wasCanceled():
+            summary.append("Cancelled by user.")
+
+        QMessageBox.information(self, "Batch BP Filter", "\n".join(summary))
+
+        if errors:
+            preview = "\n".join(errors[:5])
+            if len(errors) > 5:
+                preview += f"\n... ({len(errors) - 5} more)"
+            QMessageBox.warning(self, "Batch Errors", f"Some events could not be processed:\n{preview}")
+
     def _fit_baseline_line(self, t_vals, y_vals, clip_sigma=3.0, max_iter=4):
         """Robust linear baseline fit using iterative sigma-clipping."""
         t = np.asarray(t_vals, dtype=np.float64)
@@ -3499,28 +3733,110 @@ class OscilloscopeAnalyzer(QMainWindow):
             if best_guess:
                 guess.update(best_guess)
         elif func_name in ("QDMFit", "QDMobileFit"):
-            try:
-                desired = 201
-                max_allowed = max(5, len(y_sel) - 1)
-                w = min(desired, max_allowed)
-                if w % 2 == 0:
-                    w = max(5, w - 1)
-                y_smooth = sig.savgol_filter(y_sel, w, 2)
-            except Exception:
-                y_smooth = y_sel
-            if len(y_smooth) >= 3:
+            dt = None
+            if len(t_sel) >= 2:
+                diffs = np.diff(t_sel)
+                diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+                if diffs.size:
+                    dt = float(np.median(diffs))
+            if dt is not None and np.isfinite(dt) and dt > 0:
+                target_durations = (1e-6, 10e-6, 20e-6)
+                windows = []
+                for duration in target_durations:
+                    samples = int(round(duration / dt))
+                    if samples < 3:
+                        samples = 3
+                    if samples % 2 == 0:
+                        samples += 1
+                    windows.append(samples)
+                windows = tuple(windows)
+            else:
+                windows = (101, 501, 10001)
+
+            def _qdm_attempt(desired_window):
+                if len(y_sel) < 3:
+                    return None
+                try:
+                    max_allowed = len(y_sel)
+                    if max_allowed % 2 == 0:
+                        max_allowed -= 1
+                    max_allowed = max(3, max_allowed)
+                    w = min(desired_window, max_allowed)
+                    if w % 2 == 0:
+                        w = max(3, w - 1)
+                    y_smooth = sig.savgol_filter(y_sel, w, 2)
+                except Exception:
+                    y_smooth = y_sel
+                if len(y_smooth) < 3:
+                    return None
                 y_min = float(np.min(y_smooth))
                 diff = np.diff(y_smooth)
                 if diff.size > 0:
                     rise = int(np.argmax(diff))
                     fall = int(np.argmin(diff))
                     dt = float(t_sel[rise] - t_sel[fall]) if 0 <= rise < len(t_sel) and 0 <= fall < len(t_sel) else 0.0
-                    det_vel = 0.133 / dt if dt != 0 else 1.0
+                    det_vel = abs(0.133 / dt) if dt != 0 else 1.0
                     t0_guess = float(t_sel[fall] - 5e-6) if 0 <= fall < len(t_sel) else float(t_sel[0])
                 else:
                     det_vel = 1.0
                     t0_guess = float(t_sel[0])
-                guess.update({"t0": t0_guess, "q": y_min, "v": det_vel})
+                attempt = {"t0": t0_guess, "q": y_min, "v": det_vel}
+                if "C" in names:
+                    attempt["C"] = float(np.mean(y_sel))
+                return attempt
+
+            def _qdm_chisq(attempt):
+                func = FIT_LIB.get(func_name, (None, None))[0]
+                if func is None:
+                    return None
+                params = [attempt.get(n) for n in names]
+                if any(p is None for p in params):
+                    return None
+                try:
+                    y_model = func(t_sel, *params)
+                except Exception:
+                    return None
+                resid = y_sel - y_model
+                resid = resid[np.isfinite(resid)]
+                if resid.size == 0:
+                    return None
+                return float(np.sum(resid * resid))
+
+            windows = tuple(dict.fromkeys(windows))
+            attempt_by_window = {}
+            max_workers = min(len(windows), max(1, getattr(self, "_sg_batch_thread_count", 1)))
+            if max_workers > 1:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {executor.submit(_qdm_attempt, w): w for w in windows}
+                    for future in as_completed(futures):
+                        w = futures[future]
+                        try:
+                            attempt_by_window[w] = future.result()
+                        except Exception:
+                            attempt_by_window[w] = None
+            else:
+                for w in windows:
+                    attempt_by_window[w] = _qdm_attempt(w)
+
+            best_guess = None
+            best_chi = None
+            fallback_guess = None
+            for w in windows:
+                attempt = attempt_by_window.get(w)
+                if attempt is None:
+                    continue
+                if fallback_guess is None:
+                    fallback_guess = attempt
+                chi = _qdm_chisq(attempt)
+                if chi is None:
+                    continue
+                if best_chi is None or chi < best_chi:
+                    best_chi = chi
+                    best_guess = attempt
+            if best_guess is None:
+                best_guess = fallback_guess
+            if best_guess:
+                guess.update(best_guess)
         elif func_name == "skew_gaussian":
             area = np.trapz(y_sel, t_sel)
             peak_idx = np.argmax(y_sel)
@@ -3539,6 +3855,10 @@ class OscilloscopeAnalyzer(QMainWindow):
                 "mu": t_sel[peak_idx],
                 "sigma": max(width, 1e-9),
             })
+        elif func_name == "CSA_pulse":
+            if "t0" in names and len(y_sel) > 0:
+                min_idx = int(np.argmin(y_sel))
+                guess["t0"] = float(t_sel[min_idx])
         else:
             if "t0" in names:
                 guess["t0"] = t_sel[0]
@@ -3575,7 +3895,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             if n == "v":
                 lower.append(0)
                 upper.append(np.inf)
-            elif n == "t0" and func_name in ("QD3Fit", "QD3Fit_soft", "QDMFit", "QDMobileFit"):
+            elif n == "t0" and func_name in ("QD3Fit", "QD3Fit_soft", "QDMFit", "QDMobileFit", "CSA_pulse"):
                 lower.append(t_sel[0])
                 upper.append(t_sel[-1])
             elif n == "omega":
@@ -4745,10 +5065,16 @@ class OscilloscopeAnalyzer(QMainWindow):
 
             invert_flag = bool(rec.get("inverted", False))
             region = self.fit_regions.get(ch) or rec.get("fit_region")
-            if ch not in self.current_data:
-                QMessageBox.warning(self, "Missing Data", "Channel data is unavailable.")
-                return
-            t_full, y_full, _ = self.current_data[ch]
+            # Choose data source for low-pass adjustment: bandpass > SG > raw
+            if hasattr(self, 'use_bp_toggle') and self.use_bp_toggle.isChecked() and (ch in self.bp_filtered):
+                t_full, y_full = self.bp_filtered[ch]
+            elif hasattr(self, 'use_sg_toggle') and self.use_sg_toggle.isChecked() and (ch in self.sg_filtered):
+                t_full, y_full = self.sg_filtered[ch]
+            else:
+                if ch not in self.current_data:
+                    QMessageBox.warning(self, "Missing Data", "Channel data is unavailable.")
+                    return
+                t_full, y_full, _ = self.current_data[ch]
             if region is not None:
                 mask = (t_full >= region[0]) & (t_full <= region[1])
             else:
@@ -5489,9 +5815,9 @@ class OscilloscopeAnalyzer(QMainWindow):
                     row['min_rel_baseline'] = rec['min_rel_baseline']
             # Persist inverted flag for round-trip accuracy
             row['inverted'] = bool(rec.get('inverted', False))
-        density_val = self._get_density_for_dataset(ds_id)
-        if density_val is not None:
-            row['density'] = density_val
+            density_val = self._get_density_for_dataset(ds_id)
+            if density_val is not None:
+                row['density'] = density_val
             fit_region = rec.get('fit_region')
             if isinstance(fit_region, (tuple, list)) and len(fit_region) == 2:
                 try:
@@ -6424,6 +6750,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             "• Clear Fit: Remove the SG overlay for the current event/channel (Shift+S).\n"
             "Bandpass row:\n"
             "• Bandpass: Apply a Butterworth bandpass filter overlay for the selected channel.\n"
+            "• Batch Run: Run bandpass filtering across a range of events.\n"
             "• Clear BP: Remove the bandpass overlay for the current channel.\n"
             "• Bode: Show the bandpass frequency response.\n"
             "• Preserve Axes: Select which channels keep their zoom/pan across events.\n"
