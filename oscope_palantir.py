@@ -51,7 +51,8 @@ from fitparams    import (
     QD3Cal,
     QDMCal,
     skew_gaussian,
-    gaussian
+    gaussian,
+    asym_exp_peak
 )
 from results_plotter import FitResultsVisualizer
 import traceback
@@ -63,6 +64,7 @@ FIT_LIB = {
     "CSA_pulse": (CSA_pulse, ["t0", "C0", "C1", "C2", "T0", "T1", "T2", "C"]),
     "skew_gaussian": (skew_gaussian, ["A", "xi", "omega", "alpha", "C"]),
     "gaussian": (gaussian, ["A", "mu", "sigma", "C"]),
+    "asym_exp_peak": (asym_exp_peak, ["A", "k1", "k2", "t0", "C"]),
     # Analysis-only utility: compute and plot FFT of selection in a popup
     "FFT": (None, []),
     # Special measurement: Savitzky-Golay low-pass then take max (invert -> min)
@@ -71,6 +73,7 @@ FIT_LIB = {
     "low_pass_peak_min": (None, ["width", "baseline_slope", "baseline_intercept"]),
 }
 LOW_PASS_SPECIALS = {"low_pass_max", "low_pass_peak_min"}
+NO_INVERT_FITS = {"asym_exp_peak"}
 
 # Consistent styling for traces, filters, and fits
 RAW_TRACE_COLOR   = "C0"          # keep default blue for raw data
@@ -85,6 +88,7 @@ FIT_COLOR_PRESETS = {
     "CSA_pulse": "#8e24aa",      # purple
     "skew_gaussian": "#00897b",  # teal
     "gaussian": "#f4511e",       # warm red-orange
+    "asym_exp_peak": "#3949ab",  # indigo
     "low_pass_max": "#ef5350",   # red marker
     "low_pass_peak_min": "#26a69a",  # teal marker
 }
@@ -643,6 +647,57 @@ class BatchFitDialog(QDialog):
         impact_source = str(self.impact_source.currentText())
         func_name = str(self.func_combo.currentText())
         return ev0, ev1, t0, t1, threads, func_name, use_impact, impact_width, impact_source
+
+class BatchRemoveFitDialog(QDialog):
+    """Collects function, channel, and event range for batch removal."""
+    def __init__(self, parent, evt_min, evt_max, func_default=None, ch_default=None):
+        super().__init__(parent)
+        self.setWindowTitle("Batch Remove Fits")
+        layout = QVBoxLayout(self)
+
+        grid = QGridLayout()
+        layout.addLayout(grid)
+
+        grid.addWidget(QLabel("Fit Function"), 0, 0)
+        self.func_combo = QComboBox()
+        self.func_combo.addItems(sorted(FIT_LIB.keys()))
+        if func_default in FIT_LIB:
+            self.func_combo.setCurrentText(str(func_default))
+        grid.addWidget(self.func_combo, 0, 1)
+
+        grid.addWidget(QLabel("Channel"), 1, 0)
+        self.ch_combo = QComboBox()
+        self.ch_combo.addItems([str(i) for i in range(1, 5)])
+        if ch_default is not None:
+            self.ch_combo.setCurrentText(str(ch_default))
+        grid.addWidget(self.ch_combo, 1, 1)
+
+        grid.addWidget(QLabel("Start Event"), 2, 0)
+        self.start_evt = QLineEdit(str(evt_min))
+        self.start_evt.setToolTip("First event number to remove")
+        grid.addWidget(self.start_evt, 2, 1)
+
+        grid.addWidget(QLabel("End Event"), 3, 0)
+        self.end_evt = QLineEdit(str(evt_max))
+        self.end_evt.setToolTip("Last event number to remove")
+        grid.addWidget(self.end_evt, 3, 1)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def values(self):
+        try:
+            ev0 = int(self.start_evt.text().strip())
+            ev1 = int(self.end_evt.text().strip())
+        except Exception:
+            raise ValueError("Invalid event range")
+        if ev1 < ev0:
+            raise ValueError("End Event must be >= Start Event")
+        func_name = str(self.func_combo.currentText())
+        ch = int(self.ch_combo.currentText())
+        return ev0, ev1, func_name, ch
 
 class SGBatchDialog(QDialog):
     """Configuration dialog for running SG filtering across multiple events."""
@@ -1348,12 +1403,12 @@ class OscilloscopeAnalyzer(QMainWindow):
         # Decimation factor for plotting
         self.decim_spin = QSpinBox()
         self.decim_spin.setRange(1, 10000)
-        self.decim_spin.setValue(2)
+        self.decim_spin.setValue(10)
         self.decim_spin.setToolTip("Plot every Nth sample; 1=all data, larger values skip more points")
         self.decim_spin.valueChanged.connect(self._on_decim_change)
         self.decim_spin.setFixedWidth(btn_width)
         self.decim_spin.setMaximumHeight(btn_height)
-        nav_layout.addWidget(wrap_control("Decim:", self.decim_spin))
+        nav_layout.addWidget(wrap_control("Plt Decim:", self.decim_spin))
 
         # Co-Add waveforms
         self.btn_coadd = QPushButton("Co-Add Waves")
@@ -1640,15 +1695,16 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.bp_high.setToolTip("High cutoff frequency (Hz)")
         self.bp_high.setFixedWidth(btn_width + 20)
         self.bp_high.setMaximumHeight(btn_height)
-        bp_layout.addWidget(wrap_control("High Hz:", self.bp_high))
+        bp_layout.addWidget(wrap_control("Hi Hz:", self.bp_high))
 
         self.bp_order = QSpinBox()
         self.bp_order.setRange(1, 12)
         self.bp_order.setValue(4)
         self.bp_order.setToolTip("Butterworth filter order")
-        self.bp_order.setFixedWidth(btn_width)
+        self.bp_order.setFixedWidth(btn_width - 20)
         self.bp_order.setMaximumHeight(btn_height)
         bp_layout.addWidget(wrap_control("Order:", self.bp_order))
+        bp_layout.addSpacing(-2)
 
         self.btn_batch_bp = QPushButton("Batch Run")
         self.btn_batch_bp.setIcon(qta.icon('fa5s.play', color=self.accent))
@@ -1657,6 +1713,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_batch_bp.setFixedWidth(self.unit_width)
         self.btn_batch_bp.setMaximumHeight(btn_height)
         bp_layout.addWidget(self.btn_batch_bp)
+        bp_layout.addSpacing(-2)
 
         self.btn_clear_bp = QPushButton("Clear BP")
         self.btn_clear_bp.setIcon(qta.icon('fa5s.times', color=self.accent))
@@ -1665,6 +1722,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_clear_bp.setFixedWidth(self.unit_width)
         self.btn_clear_bp.setMaximumHeight(btn_height)
         bp_layout.addWidget(self.btn_clear_bp)
+        bp_layout.addSpacing(-2)
 
         self.btn_bp_bode = QPushButton("Bode")
         self.btn_bp_bode.setIcon(qta.icon('fa5s.chart-area', color=self.accent))
@@ -1684,7 +1742,7 @@ class OscilloscopeAnalyzer(QMainWindow):
 
         self.dyn_func_combo = QComboBox()
         self.dyn_func_combo.addItems(sorted(FIT_LIB.keys()))
-        self.dyn_func_combo.setToolTip("Q=QD3Fit, D=QDMFit, C=CSA_pulse, W=skew_gaussian, G=gaussian, Shift+F=FFT, X=low_pass_max, Z=low_pass_peak_min")
+        self.dyn_func_combo.setToolTip("Q=QD3Fit, D=QDMFit, C=CSA_pulse, W=skew_gaussian, G=gaussian, Y=asym_exp_peak, Shift+F=FFT, X=low_pass_max, Z=low_pass_peak_min")
         self.dyn_func_combo.setFixedWidth(self.unit_width+2)
         self.dyn_func_combo.setMaximumHeight(btn_height)
         ctrl_layout5.addWidget(self.dyn_func_combo)
@@ -1746,6 +1804,15 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_clear_chan.setFixedWidth(self.unit_width)
         self.btn_clear_chan.setMaximumHeight(btn_height)
         ctrl_layout5.addWidget(self.btn_clear_chan)
+
+        # Batch remove fits by function/channel/event range
+        self.btn_batch_remove = QPushButton("Batch Remove")
+        self.btn_batch_remove.setIcon(qta.icon('fa5s.trash', color=self.accent))
+        self.btn_batch_remove.setToolTip("Remove fits by function/channel over an event range")
+        self.btn_batch_remove.clicked.connect(self.run_batch_remove_fits)
+        self.btn_batch_remove.setFixedWidth(self.unit_width)
+        self.btn_batch_remove.setMaximumHeight(btn_height)
+        ctrl_layout5.addWidget(self.btn_batch_remove)
 
         # Batch run across multiple events for the selected fit/channel
         self.btn_batch_dyn = QPushButton("Batch Run")
@@ -2273,6 +2340,9 @@ class OscilloscopeAnalyzer(QMainWindow):
         elif key == Qt.Key_G:
             if hasattr(self, 'dyn_func_combo') and self.dyn_func_combo.isEnabled():
                 self.dyn_func_combo.setCurrentText("gaussian")
+        elif key == Qt.Key_Y:
+            if hasattr(self, 'dyn_func_combo') and self.dyn_func_combo.isEnabled():
+                self.dyn_func_combo.setCurrentText("asym_exp_peak")
         elif key == Qt.Key_X:
             if hasattr(self, 'dyn_func_combo') and self.dyn_func_combo.isEnabled():
                 self.dyn_func_combo.setCurrentText("low_pass_max")
@@ -2353,6 +2423,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         add_shortcut(Qt.Key_C, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("CSA_pulse")))
         add_shortcut(Qt.Key_W, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("skew_gaussian")))
         add_shortcut(Qt.Key_G, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("gaussian")))
+        add_shortcut(Qt.Key_Y, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("asym_exp_peak")))
         add_shortcut(Qt.Key_X, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("low_pass_max")))
         add_shortcut(Qt.Key_Z, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("low_pass_peak_min")))
         # Shift+F selects FFT without overriding plain F (Select Folder)
@@ -3620,7 +3691,7 @@ class OscilloscopeAnalyzer(QMainWindow):
 
         return slope, intercept
 
-    def _guess_params(self, func_name, names, t_sel, y_sel):
+    def _guess_params(self, func_name, names, t_sel, y_sel, invert_flag: bool = False):
         """Return initial parameter guesses and bounds for curve_fit."""
         guess = {}
         lower = []
@@ -3855,6 +3926,26 @@ class OscilloscopeAnalyzer(QMainWindow):
                 "mu": t_sel[peak_idx],
                 "sigma": max(width, 1e-9),
             })
+        elif func_name == "asym_exp_peak":
+            if len(t_sel) > 0:
+                peak_idx = int(np.argmin(y_sel)) if invert_flag else int(np.argmax(y_sel))
+                a_guess = float(y_sel[peak_idx])
+                if invert_flag:
+                    if a_guess >= 0:
+                        a_guess = -abs(a_guess) if a_guess != 0 else -1e-12
+                else:
+                    if a_guess <= 0:
+                        a_guess = abs(a_guess) if a_guess != 0 else 1e-12
+                guess["A"] = a_guess
+                guess["t0"] = float(t_sel[peak_idx])
+            window = (t_sel[-1] - t_sel[0]) if len(t_sel) > 1 else 1.0
+            if not np.isfinite(window) or window <= 0:
+                window = 1.0
+            k_guess = 4.0 / window
+            if not np.isfinite(k_guess) or k_guess <= 0:
+                k_guess = 1.0
+            guess["k1"] = k_guess
+            guess["k2"] = k_guess
         elif func_name == "CSA_pulse":
             if "t0" in names and len(y_sel) > 0:
                 min_idx = int(np.argmin(y_sel))
@@ -3892,10 +3983,20 @@ class OscilloscopeAnalyzer(QMainWindow):
             guess["C"] = float(np.mean(y_sel))
 
         for n in names:
-            if n == "v":
+            if func_name == "asym_exp_peak" and n == "A":
+                if invert_flag:
+                    lower.append(-np.inf)
+                    upper.append(0)
+                else:
+                    lower.append(0)
+                    upper.append(np.inf)
+            elif func_name == "asym_exp_peak" and n in ("k1", "k2"):
                 lower.append(0)
                 upper.append(np.inf)
-            elif n == "t0" and func_name in ("QD3Fit", "QD3Fit_soft", "QDMFit", "QDMobileFit", "CSA_pulse"):
+            elif n == "v":
+                lower.append(0)
+                upper.append(np.inf)
+            elif n == "t0" and func_name in ("QD3Fit", "QD3Fit_soft", "QDMFit", "QDMobileFit", "CSA_pulse", "asym_exp_peak"):
                 lower.append(t_sel[0])
                 upper.append(t_sel[-1])
             elif n == "omega":
@@ -3942,7 +4043,7 @@ class OscilloscopeAnalyzer(QMainWindow):
 
         invert_flag = self.dyn_invert.isChecked()
         y_base = y_sel
-        y_for_fit = -y_base if (invert_flag and func_name not in LOW_PASS_SPECIALS) else y_base
+        y_for_fit = -y_base if (invert_flag and func_name not in LOW_PASS_SPECIALS and func_name not in NO_INVERT_FITS) else y_base
 
         # Optional decimation prior to fitting/measurements
         decim_factor = 1
@@ -4084,7 +4185,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             return
 
         # Standard curve_fit path
-        guess, lower, upper = self._guess_params(func_name, names, t_fit, y_fit)
+        guess, lower, upper = self._guess_params(func_name, names, t_fit, y_fit, invert_flag=invert_flag)
         p0 = [guess.get(n, 0.0) for n in names]
         bounds = None
         if any(np.isfinite(lower)) or any(np.isfinite(upper)):
@@ -4610,7 +4711,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             if t_sel_full.size < window_min_samples:
                 return {"status": "skip", "event": evt_key}
 
-            y_fit_full = -y_sel_full if (invert_flag and func_name not in LOW_PASS_SPECIALS) else y_sel_full
+            y_fit_full = -y_sel_full if (invert_flag and func_name not in LOW_PASS_SPECIALS and func_name not in NO_INVERT_FITS) else y_sel_full
 
             if decim_factor > 1:
                 t_fit = t_sel_full[::decim_factor]
@@ -4699,7 +4800,7 @@ class OscilloscopeAnalyzer(QMainWindow):
                 return payload
 
             try:
-                guess, lower, upper = guess_params(func_name, names, t_fit, y_fit)
+                guess, lower, upper = guess_params(func_name, names, t_fit, y_fit, invert_flag=invert_flag)
                 p0 = [guess.get(n, 0.0) for n in names]
                 lower_arr = np.asarray(lower, dtype=np.float64)
                 upper_arr = np.asarray(upper, dtype=np.float64)
@@ -4858,7 +4959,7 @@ class OscilloscopeAnalyzer(QMainWindow):
                                 added += 1
                                 continue
                             y_model = func(t_plot, *params)
-                            if invert_flag and func_name not in LOW_PASS_SPECIALS:
+                            if invert_flag and func_name not in LOW_PASS_SPECIALS and func_name not in NO_INVERT_FITS:
                                 y_model = -y_model
                             label = f"{func_name} Fit {idx}" if idx > 1 else f"{func_name} Fit"
                             color = self._resolve_fit_color(func_name)
@@ -4894,6 +4995,120 @@ class OscilloscopeAnalyzer(QMainWindow):
             QMessageBox.information(self, "Batch Complete", "No fits were added. Check time window and channel files.")
         else:
             QMessageBox.information(self, "Batch Complete", f"Added {added} fits.")
+
+    def run_batch_remove_fits(self):
+        """Remove fits by function, channel, and event range."""
+        if not self.results:
+            QMessageBox.information(self, "No Fits", "There are no fits to remove.")
+            return
+
+        # Derive event bounds from the current event list (fallback: from results)
+        ev_pairs = []
+        for i in range(self.event_combo.count()):
+            key = self.event_combo.itemText(i)
+            try:
+                iv = int(key)
+            except Exception:
+                m = re.search(r"(\d+)$", key)
+                if not m:
+                    continue
+                iv = int(m.group(1))
+            ev_pairs.append((iv, key))
+
+        if ev_pairs:
+            ev_pairs.sort(key=lambda x: x[0])
+            evt_min = ev_pairs[0][0]
+            evt_max = ev_pairs[-1][0]
+        else:
+            evt_vals = []
+            pat = re.compile(r'^evt_(.+?)_(.+)_ch(\d+)(?:_\d+)?$')
+            for key in self.results.keys():
+                m = pat.match(key)
+                if not m:
+                    continue
+                evt_key = m.group(1)
+                try:
+                    evt_vals.append(int(evt_key))
+                except Exception:
+                    m2 = re.search(r"(\d+)$", evt_key)
+                    if m2:
+                        evt_vals.append(int(m2.group(1)))
+            if not evt_vals:
+                QMessageBox.information(self, "No Events", "Unable to infer event numbers for removal.")
+                return
+            evt_min = min(evt_vals)
+            evt_max = max(evt_vals)
+
+        func_default = self.dyn_func_combo.currentText()
+        ch_default = int(self.dyn_ch_combo.currentText())
+        dlg = BatchRemoveFitDialog(self, evt_min, evt_max, func_default, ch_default)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        try:
+            ev0, ev1, func_name, ch = dlg.values()
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid Input", str(e))
+            return
+        if func_name not in FIT_LIB:
+            QMessageBox.warning(self, "Invalid Fit", "Choose a valid fit function.")
+            return
+
+        pattern = re.compile(r'^evt_(.+?)_(.+)_ch(\d+)(?:_\d+)?$')
+        removed_keys = []
+        removed = 0
+        for key in list(self.results.keys()):
+            m = pattern.match(key)
+            if not m:
+                continue
+            evt_key, fit_type, ch_str = m.groups()
+            if fit_type != func_name:
+                continue
+            try:
+                ch_key = int(ch_str)
+            except Exception:
+                continue
+            if ch_key != ch:
+                continue
+            try:
+                evt_int = int(evt_key)
+            except Exception:
+                m_evt = re.search(r"(\d+)$", evt_key)
+                if not m_evt:
+                    continue
+                evt_int = int(m_evt.group(1))
+            if not (ev0 <= evt_int <= ev1):
+                continue
+            rec = self.results.pop(key, None)
+            if rec is not None:
+                for line_name in ("line", "min_line"):
+                    line = rec.get(line_name)
+                    if line is None:
+                        continue
+                    try:
+                        if line in line.axes.lines:
+                            line.remove()
+                    except Exception:
+                        pass
+            removed_keys.append(key)
+            removed += 1
+
+        if removed_keys:
+            for ax in self.figure.axes:
+                for line in list(ax.lines):
+                    gid = line.get_gid()
+                    if isinstance(gid, str) and gid in removed_keys:
+                        try:
+                            ax.lines.remove(line)
+                        except Exception:
+                            pass
+                ax.legend()
+            self.canvas.draw()
+            self.fit_info_window.update_info(self.results, self.event_combo.currentText())
+
+        if removed == 0:
+            QMessageBox.information(self, "Batch Remove", "No matching fits were found.")
+        else:
+            QMessageBox.information(self, "Batch Remove", f"Removed {removed} fits.")
 
     def _cancel_fit(self):
         if hasattr(self, "fit_worker") and self.fit_worker is not None:
@@ -4990,7 +5205,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             })
 
         y_fit = func_name and FIT_LIB[func_name][0](t_sel, *popt)
-        if self.dyn_invert.isChecked():
+        if self.dyn_invert.isChecked() and func_name not in NO_INVERT_FITS:
             y_fit = -y_fit
         ax = self._get_axis_for_channel(ch)
         if ax is None:
@@ -5412,9 +5627,10 @@ class OscilloscopeAnalyzer(QMainWindow):
             t, y, _ = self.current_data[ch]
         mask = (t >= region[0]) & (t <= region[1])
         t_sel, y_sel = t[mask], y[mask]
-        if rec.get("inverted", False):
+        inverted_rec = bool(rec.get("inverted", False))
+        if inverted_rec and func_name not in NO_INVERT_FITS:
             y_sel = -y_sel
-        guess, lower, upper = self._guess_params(func_name, names, t_sel, y_sel)
+        guess, lower, upper = self._guess_params(func_name, names, t_sel, y_sel, invert_flag=inverted_rec)
         bounds = (lower, upper) if any(np.isfinite(lower)) or any(np.isfinite(upper)) else None
         dlg = SciFitParamsDialog({n: p for n, p in zip(names, params)}, func, t_sel, y_sel, names, bounds, parent=self)
         ax = self._get_axis_for_channel(ch)
@@ -5429,7 +5645,7 @@ class OscilloscopeAnalyzer(QMainWindow):
                 return
             new_params = [param_dict[n] for n in names]
             y_fit = func(t_sel, *new_params)
-            if invert_flag:
+            if invert_flag and func_name not in NO_INVERT_FITS:
                 y_plot = -y_fit
             else:
                 y_plot = y_fit
@@ -5670,9 +5886,9 @@ class OscilloscopeAnalyzer(QMainWindow):
         func = FIT_LIB.get(func_name, (None,))[0]
         if func is None:
             return
-        y_sel_eff = -y_sel if inverted else y_sel
+        y_sel_eff = -y_sel if (inverted and func_name not in NO_INVERT_FITS) else y_sel
         y_fit = func(t_sel, *params)
-        if inverted:
+        if inverted and func_name not in NO_INVERT_FITS:
             y_fit = -y_fit
         line = rec.get("line")
         if line in ax.lines:
@@ -6764,6 +6980,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             "• Adjust Fit (A): Edit initial parameters before running the fit.\n"
             "• Clear Fit (R): Remove the active dynamic fit result.\n"
             "• Clear Chan Fits (Shift+R): Remove all fits on the selected channel for this event.\n"
+            "• Batch Remove: Remove fits by function/channel across an event range.\n"
             "• Batch Run (B): Run the selected fit across multiple events (time window or impact-centered).\n"
             "Toggles:\n"
             "• Invert (I): Invert polarity for fitting (also flips low_pass_max/low_pass_peak_min extremum).\n"
@@ -6783,7 +7000,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             "  Meta:        L (Load Metadata),  M (MetaMatch)\n"
             "  SG/Filters:  S (SG),  Ctrl+B (SG Batch),  Shift+S (Clear SG),  Shift+B (Bandpass),  P (Results Plotter),  Ctrl+F (Feature Scan),  Ctrl+Shift+F (Fit Filter),  Ctrl+K (Clear Filter)\n"
             "  Dynamic:     Enter (Run),  A (Adjust),  R (Clear Fit),  Shift+R (Clear Chan Fits),  B (Batch),  Ctrl+Shift+S (Toggle Use SG)\n"
-            "               Q/D/C/W/G/X/Z selects QD3/QDM/CSA/skew/gauss/low_pass_max/low_pass_peak_min; 1-8 selects channel; I toggles invert.\n"
+            "               Q/D/C/W/G/Y/X/Z selects QD3/QDM/CSA/skew/gauss/asym_exp_peak/low_pass_max/low_pass_peak_min; 1-8 selects channel; I toggles invert.\n"
             "  Info:        H (Help),  U (Fit Info),  Ctrl+T (Theme)\n"
         )
         dlg = QDialog(self)
@@ -6805,7 +7022,7 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     app.setStyle('fusion')
     win = OscilloscopeAnalyzer()
-    win.show()
+    win.showMaximized()
     sys.exit(app.exec_())
 
 # END
