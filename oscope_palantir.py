@@ -46,6 +46,7 @@ from fitparams    import (
     getMetaData,
     metaMatch,
     CSA_pulse,
+    CSA_pulse_exp,
     QD3Fit,
     QDMFit,
     QD3Cal,
@@ -62,6 +63,7 @@ FIT_LIB = {
     "QD3Fit": (QD3Fit, ["t0", "q", "v", "C"]),
     "QDMFit": (QDMFit, ["t0", "q", "v", "C"]),
     "CSA_pulse": (CSA_pulse, ["t0", "C0", "C1", "C2", "T0", "T1", "T2", "C"]),
+    "CSA_pulse_exp": (CSA_pulse_exp, ["C0", "A", "x0", "Tdown", "m", "x1", "Tdec"]),
     "skew_gaussian": (skew_gaussian, ["A", "xi", "omega", "alpha", "C"]),
     "gaussian": (gaussian, ["A", "mu", "sigma", "C"]),
     "asym_exp_peak": (asym_exp_peak, ["A", "k1", "k2", "t0", "C"]),
@@ -86,6 +88,7 @@ FIT_COLOR_PRESETS = {
     "QD3Fit": "#ff8f00",         # deep orange
     "QDMFit": "#d81b60",         # magenta
     "CSA_pulse": "#8e24aa",      # purple
+    "CSA_pulse_exp": "#546e7a",  # blue grey
     "skew_gaussian": "#00897b",  # teal
     "gaussian": "#f4511e",       # warm red-orange
     "asym_exp_peak": "#3949ab",  # indigo
@@ -210,6 +213,16 @@ class FitInfoWindow(QWidget):
                 if "charge" in rec: row["charge"] = rec["charge"]
                 if "mass" in rec: row["mass"] = rec["mass"]
                 if "radius" in rec: row["radius"] = rec["radius"]
+            elif ft == "csa_pulse_exp":
+                row.update({
+                    "C0": params[0] if len(params) > 0 else None,
+                    "A": params[1] if len(params) > 1 else None,
+                    "x0": params[2] if len(params) > 2 else None,
+                    "Tdown": params[3] if len(params) > 3 else None,
+                    "m": params[4] if len(params) > 4 else None,
+                    "x1": params[5] if len(params) > 5 else None,
+                    "Tdec": params[6] if len(params) > 6 else None,
+                })
             elif ft.startswith("csa"):
                 row.update({
                     "t0": params[0] if len(params) > 0 else None,
@@ -667,7 +680,7 @@ class BatchRemoveFitDialog(QDialog):
 
         grid.addWidget(QLabel("Channel"), 1, 0)
         self.ch_combo = QComboBox()
-        self.ch_combo.addItems([str(i) for i in range(1, 5)])
+        self.ch_combo.addItems([str(i) for i in range(1, 9)])
         if ch_default is not None:
             self.ch_combo.setCurrentText(str(ch_default))
         grid.addWidget(self.ch_combo, 1, 1)
@@ -902,7 +915,7 @@ class FeatureScanDialog(QDialog):
 
         grid.addWidget(QLabel("Channel"), 2, 0)
         self.ch_combo = QComboBox()
-        self.ch_combo.addItems([str(i) for i in range(1, 5)])
+        self.ch_combo.addItems([str(i) for i in range(1, 9)])
         self.ch_combo.setCurrentText(str(ch_default))
         grid.addWidget(self.ch_combo, 2, 1)
 
@@ -1028,7 +1041,7 @@ class FitFilterDialog(QDialog):
         # Channel
         grid.addWidget(QLabel("Channel"), 1, 0)
         self.ch_combo = QComboBox()
-        self.ch_combo.addItems([str(i) for i in range(1, 5)])
+        self.ch_combo.addItems([str(i) for i in range(1, 9)])
         self.ch_combo.setCurrentText(str(ch_default))
         grid.addWidget(self.ch_combo, 1, 1)
 
@@ -1260,12 +1273,12 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.channel_axis_limits = {}
         self.preserve_axes_channels = set()
         self._preserve_axis_actions = {}
-        self._preserve_axes_menu_channels = [1, 2, 3, 4]
+        self._preserve_axes_menu_channels = [1, 2, 3, 4, 5, 6, 7, 8]
         self.dataset_densities = {}
         self._density_spin_guard = False
         self.hidden_channels = set()
         self._channel_visibility_actions = {}
-        self._channel_visibility_menu_channels = [1, 2, 3, 4]
+        self._channel_visibility_menu_channels = [1, 2, 3, 4, 5, 6, 7, 8]
         self._suspend_axis_capture = False
         self.metaArr         = None
         self._fit_color_map  = dict(FIT_COLOR_PRESETS)
@@ -1545,7 +1558,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         #Channel selector label
         #channel selector
         self.sg_ch = QComboBox()
-        self.sg_ch.addItems([str(i) for i in range(1,5)])
+        self.sg_ch.addItems([str(i) for i in range(1,9)])
         self.sg_ch.setCurrentText("1")
         self.sg_ch.setMaximumHeight(btn_height)
         self.sg_ch.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -1671,7 +1684,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         bp_layout.addWidget(self.btn_bandpass)
 
         self.bp_ch = QComboBox()
-        self.bp_ch.addItems([str(i) for i in range(1, 5)])
+        self.bp_ch.addItems([str(i) for i in range(1, 9)])
         self.bp_ch.setCurrentText("1")
         self.bp_ch.setMaximumHeight(btn_height)
         self.bp_ch.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -1742,14 +1755,14 @@ class OscilloscopeAnalyzer(QMainWindow):
 
         self.dyn_func_combo = QComboBox()
         self.dyn_func_combo.addItems(sorted(FIT_LIB.keys()))
-        self.dyn_func_combo.setToolTip("Q=QD3Fit, D=QDMFit, C=CSA_pulse, W=skew_gaussian, G=gaussian, Y=asym_exp_peak, Shift+F=FFT, X=low_pass_max, Z=low_pass_peak_min")
+        self.dyn_func_combo.setToolTip("Q=QD3Fit, D=QDMFit, C=CSA_pulse, V=CSA_pulse_exp, W=skew_gaussian, G=gaussian, Y=asym_exp_peak, Shift+F=FFT, X=low_pass_max, Z=low_pass_peak_min")
         self.dyn_func_combo.setFixedWidth(self.unit_width+2)
         self.dyn_func_combo.setMaximumHeight(btn_height)
         ctrl_layout5.addWidget(self.dyn_func_combo)
 
         # Channel selection then optional invert
         self.dyn_ch_combo = QComboBox()
-        self.dyn_ch_combo.addItems([str(i) for i in range(1,5)])
+        self.dyn_ch_combo.addItems([str(i) for i in range(1,9)])
         self.dyn_ch_combo.setCurrentText("1")
         self.dyn_ch_combo.setMaximumHeight(btn_height)
         self.dyn_ch_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -2079,7 +2092,7 @@ class OscilloscopeAnalyzer(QMainWindow):
 
         # Load waveform data
         for path in self.event_files.get(evt, []):
-            m = re.match(r"C([1-4])", os.path.basename(path))
+            m = re.match(r"C([1-8])", os.path.basename(path))
             if not m:
                 continue
             ch = int(m.group(1))
@@ -2334,6 +2347,9 @@ class OscilloscopeAnalyzer(QMainWindow):
         elif key == Qt.Key_C:
             if hasattr(self, 'dyn_func_combo') and self.dyn_func_combo.isEnabled():
                 self.dyn_func_combo.setCurrentText("CSA_pulse")
+        elif key == Qt.Key_V:
+            if hasattr(self, 'dyn_func_combo') and self.dyn_func_combo.isEnabled():
+                self.dyn_func_combo.setCurrentText("CSA_pulse_exp")
         elif key == Qt.Key_W:
             if hasattr(self, 'dyn_func_combo') and self.dyn_func_combo.isEnabled():
                 self.dyn_func_combo.setCurrentText("skew_gaussian")
@@ -2421,6 +2437,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         add_shortcut(Qt.Key_Q, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("QD3Fit")))
         add_shortcut(Qt.Key_D, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("QDMFit")))
         add_shortcut(Qt.Key_C, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("CSA_pulse")))
+        add_shortcut(Qt.Key_V, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("CSA_pulse_exp")))
         add_shortcut(Qt.Key_W, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("skew_gaussian")))
         add_shortcut(Qt.Key_G, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("gaussian")))
         add_shortcut(Qt.Key_Y, lambda: (self.dyn_func_combo.isEnabled() and self.dyn_func_combo.setCurrentText("asym_exp_peak")))
@@ -2511,7 +2528,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             channels = self._preserve_axes_menu_channels
         channels = sorted({int(ch) for ch in channels if ch is not None})
         if not channels:
-            channels = [1, 2, 3, 4]
+            channels = [1, 2, 3, 4, 5, 6, 7, 8]
         self._preserve_axes_menu_channels = channels
         self.preserve_axes_menu.clear()
         all_action = self.preserve_axes_menu.addAction("All Channels")
@@ -2602,7 +2619,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             channels = self._channel_visibility_menu_channels
         channels = sorted({int(ch) for ch in channels if ch is not None})
         if not channels:
-            channels = [1, 2, 3, 4]
+            channels = [1, 2, 3, 4, 5, 6, 7, 8]
         self._channel_visibility_menu_channels = channels
         self.channel_visibility_menu.clear()
         show_all_action = self.channel_visibility_menu.addAction("Show All")
@@ -3950,6 +3967,49 @@ class OscilloscopeAnalyzer(QMainWindow):
             if "t0" in names and len(y_sel) > 0:
                 min_idx = int(np.argmin(y_sel))
                 guess["t0"] = float(t_sel[min_idx])
+        elif func_name == "CSA_pulse_exp":
+            if len(t_sel) > 0:
+                t_arr = np.asarray(t_sel, dtype=np.float64)
+                y_arr = np.asarray(y_sel, dtype=np.float64)
+                n = len(t_arr)
+                min_idx = int(np.argmin(y_arr))
+                x0_guess = float(t_arr[min_idx])
+                if min_idx < n - 1:
+                    max_idx = int(np.argmax(y_arr[min_idx:])) + min_idx
+                else:
+                    max_idx = int(np.argmax(y_arr))
+                x1_guess = float(t_arr[max_idx])
+                if x1_guess < x0_guess:
+                    x1_guess = x0_guess
+
+                if min_idx > 0:
+                    C0_guess = float(np.median(y_arr[:min_idx]))
+                else:
+                    head_n = max(1, n // 10)
+                    C0_guess = float(np.median(y_arr[:head_n]))
+                y_min = float(y_arr[min_idx])
+                A_guess = float(C0_guess - y_min)
+
+                dt = float(x1_guess - x0_guess)
+                if dt != 0:
+                    m_guess = (float(y_arr[max_idx]) - (C0_guess - A_guess)) / dt
+                else:
+                    m_guess = 0.0
+
+                window = float(t_arr[-1] - t_arr[0]) if n > 1 else 1.0
+                if not np.isfinite(window) or window <= 0:
+                    window = 1.0
+                Tdown_guess = max(window / 10.0, 1e-9)
+                Tdec_guess = max(window / 5.0, 1e-9)
+                guess.update({
+                    "C0": C0_guess,
+                    "A": A_guess,
+                    "x0": x0_guess,
+                    "Tdown": Tdown_guess,
+                    "m": m_guess,
+                    "x1": x1_guess,
+                    "Tdec": Tdec_guess,
+                })
         else:
             if "t0" in names:
                 guess["t0"] = t_sel[0]
@@ -3993,6 +4053,9 @@ class OscilloscopeAnalyzer(QMainWindow):
             elif func_name == "asym_exp_peak" and n in ("k1", "k2"):
                 lower.append(0)
                 upper.append(np.inf)
+            elif func_name == "CSA_pulse_exp" and n == "A":
+                lower.append(0)
+                upper.append(np.inf)
             elif n == "v":
                 lower.append(0)
                 upper.append(np.inf)
@@ -4002,6 +4065,30 @@ class OscilloscopeAnalyzer(QMainWindow):
             elif n == "omega":
                 lower.append(0)
                 upper.append(np.inf)
+            elif n in ("Tdown", "Tdec"):
+                lower.append(0)
+                upper.append(np.inf)
+            elif n == "x0":
+                lower.append(t_sel[0])
+                upper.append(t_sel[-1])
+            elif n == "x1":
+                if func_name == "CSA_pulse_exp":
+                    x0_guess = guess.get("x0", t_sel[0])
+                    try:
+                        x0_guess = float(x0_guess)
+                    except Exception:
+                        x0_guess = t_sel[0]
+                    upper_x1 = t_sel[-1]
+                    lower_x1 = max(t_sel[0], min(x0_guess, upper_x1))
+                    if lower_x1 < upper_x1:
+                        span = upper_x1 - t_sel[0]
+                        eps = max(1e-12, 1e-9 * abs(span))
+                        lower_x1 = min(lower_x1 + eps, upper_x1)
+                    lower.append(lower_x1)
+                    upper.append(upper_x1)
+                else:
+                    lower.append(t_sel[0])
+                    upper.append(t_sel[-1])
             else:
                 lower.append(-np.inf)
                 upper.append(np.inf)
@@ -5994,6 +6081,18 @@ class OscilloscopeAnalyzer(QMainWindow):
                     'radius': rec.get('radius', None),
                 })
                 row['impact_time'] = rec.get('impact_time', None)
+            elif ft == 'csa_pulse_exp':
+                if not param_names:
+                    param_names = ["C0", "A", "x0", "Tdown", "m", "x1", "Tdec"]
+                row.update({
+                    'C0': params[0] if len(params)>0 else None,
+                    'A': params[1] if len(params)>1 else None,
+                    'x0': params[2] if len(params)>2 else None,
+                    'Tdown': params[3] if len(params)>3 else None,
+                    'm': params[4] if len(params)>4 else None,
+                    'x1': params[5] if len(params)>5 else None,
+                    'Tdec': params[6] if len(params)>6 else None,
+                })
             elif ft.startswith('csa'):
                 if not param_names:
                     param_names = ["t0", "C0", "C1", "C2", "T0", "T1", "T2", "C"]
@@ -7000,7 +7099,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             "  Meta:        L (Load Metadata),  M (MetaMatch)\n"
             "  SG/Filters:  S (SG),  Ctrl+B (SG Batch),  Shift+S (Clear SG),  Shift+B (Bandpass),  P (Results Plotter),  Ctrl+F (Feature Scan),  Ctrl+Shift+F (Fit Filter),  Ctrl+K (Clear Filter)\n"
             "  Dynamic:     Enter (Run),  A (Adjust),  R (Clear Fit),  Shift+R (Clear Chan Fits),  B (Batch),  Ctrl+Shift+S (Toggle Use SG)\n"
-            "               Q/D/C/W/G/Y/X/Z selects QD3/QDM/CSA/skew/gauss/asym_exp_peak/low_pass_max/low_pass_peak_min; 1-8 selects channel; I toggles invert.\n"
+            "               Q/D/C/V/W/G/Y/X/Z selects QD3/QDM/CSA/CSA_pulse_exp/skew/gauss/asym_exp_peak/low_pass_max/low_pass_peak_min; 1-8 selects channel; I toggles invert.\n"
             "  Info:        H (Help),  U (Fit Info),  Ctrl+T (Theme)\n"
         )
         dlg = QDialog(self)
