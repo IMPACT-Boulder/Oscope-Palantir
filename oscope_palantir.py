@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRegExp, QSettings
-from PyQt5.QtGui import QRegExpValidator, QKeySequence, QValidator
+from PyQt5.QtGui import QRegExpValidator, QKeySequence, QValidator, QIcon
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QDoubleSpinBox, QSpinBox,
     QPushButton, QComboBox, QFileDialog, QMessageBox, QLabel, QCheckBox, QDialog, QInputDialog,
@@ -1525,6 +1525,13 @@ class OscilloscopeAnalyzer(QMainWindow):
         self.btn_mark_impact.setFixedWidth(self.unit_width)
         meta_layout.addWidget(self.btn_mark_impact)
 
+        self.btn_shared_x = QPushButton("Shared Time Axis")
+        self.btn_shared_x.setCheckable(True)
+        self.btn_shared_x.setToolTip("Align all visible channels to one time axis and compact the plots")
+        self.btn_shared_x.setFixedWidth(self.unit_width)
+        self.btn_shared_x.toggled.connect(self._on_shared_x_toggled)
+        meta_layout.addWidget(self.btn_shared_x)
+
         # Display metadata match output
         self.meta_label = QLabel("MetaMatch: ")
         self.meta_label.setWordWrap(True)
@@ -1883,7 +1890,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         widgets = [
             self.event_combo, self.btn_prev, self.btn_next, self.decim_spin, self.quality_spin, self.density_spin,
             self.btn_coadd,
-            self.btn_load_meta, self.btn_meta, self.dist_spin, self.btn_mark_impact,
+            self.btn_load_meta, self.btn_meta, self.dist_spin, self.btn_mark_impact, self.btn_shared_x,
             self.btn_clear, self.btn_save_fig, self.btn_export, self.btn_import,
             self.btn_clear_data, self.btn_show_info,
             self.btn_sg, self.sg_ch, self.sg_win,
@@ -1940,6 +1947,10 @@ class OscilloscopeAnalyzer(QMainWindow):
             }}
             QPushButton:hover {{
                 background-color: {button_hover};
+            }}
+            QPushButton:checked {{
+                background-color: {self.accent};
+                color: #1e1e1e;
             }}
             QToolButton {{
                 background-color: {button_bg};
@@ -2037,10 +2048,12 @@ class OscilloscopeAnalyzer(QMainWindow):
             self.set_controls_enabled(False)
             return
 
-        pat = re.compile(r"-(\d+)\.trc$")
+        # LeCroy exports include both C4Fe00001.trc (older campaigns)
+        # and C4--Fe--00001.trc. Preserve the full, zero-padded event ID.
+        pat = re.compile(r"^C[1-8].*?(\d+)\.(?i:trc)$")
         events = {}
         for f in files:
-            m = pat.search(f)
+            m = pat.match(os.path.basename(f))
             if m:
                 events.setdefault(m.group(1), []).append(f)
         if not events:
@@ -2458,7 +2471,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         add_shortcut(Qt.Key_Enter,  lambda: (self.btn_dyn.isEnabled() and self.run_dynamic_fit()))
         add_shortcut(Qt.Key_A,      lambda: (self.btn_adjust_dyn.isEnabled() and self.adjust_dynamic_params()))
 
-    def _apply_saved_axis_limits(self, ax, ch):
+    def _apply_saved_axis_limits(self, ax, ch, apply_x=True):
         """Restore persisted axis limits for a channel, if any."""
         if not self._preserve_axes_enabled(ch):
             return
@@ -2467,7 +2480,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             return
         xlim = limits.get('xlim')
         ylim = limits.get('ylim')
-        if xlim is not None:
+        if apply_x and xlim is not None:
             ax.set_xlim(xlim)
         if ylim is not None:
             ax.set_ylim(ylim)
@@ -2682,12 +2695,12 @@ class OscilloscopeAnalyzer(QMainWindow):
                 'ylim': tuple(ax.get_ylim()),
             }
 
-    def _refresh_current_event_plots(self):
+    def _refresh_current_event_plots(self, xlim_override=None):
         """Replot current event waveforms and overlays using stored data."""
         evt = self.event_combo.currentText()
         if not evt or not self.current_data:
             return
-        self.plot_waveforms()
+        self.plot_waveforms(xlim_override=xlim_override)
         self._redraw_sg_overlays()
         self._redraw_bandpass_overlays()
         self.recall_fits_for_event(evt)
@@ -2727,11 +2740,26 @@ class OscilloscopeAnalyzer(QMainWindow):
 
     def _store_axis_limits_from_axes(self, ax):
         ch = self._axis_to_channel.get(ax)
-        if ch is None or not self._preserve_axes_enabled(ch):
+        if ch is None:
+            return
+        if self.btn_shared_x.isChecked():
+            for preserved_ch in self.preserve_axes_channels:
+                limits = self.channel_axis_limits.setdefault(preserved_ch, {'xlim': None, 'ylim': None})
+                limits['xlim'] = tuple(ax.get_xlim())
+        if not self._preserve_axes_enabled(ch):
             return
         limits = self.channel_axis_limits.setdefault(ch, {'xlim': None, 'ylim': None})
         limits['xlim'] = tuple(ax.get_xlim())
         limits['ylim'] = tuple(ax.get_ylim())
+
+    def _on_shared_x_toggled(self, checked):
+        # Keep the current time window when switching plot layouts.
+        xlim = self.figure.axes[0].get_xlim() if self.figure.axes else None
+        self._refresh_current_event_plots(xlim_override=xlim)
+        if checked and xlim is not None:
+            for ch in self.preserve_axes_channels:
+                limits = self.channel_axis_limits.setdefault(ch, {'xlim': None, 'ylim': None})
+                limits['xlim'] = tuple(xlim)
 
     def _plot_sg_curve(self, ch, t, y_sg, redraw=True):
         """Overlay SG line for a channel, replacing any prior SG curve."""
@@ -2981,7 +3009,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             self.canvas.draw()
         return loaded
 
-    def plot_waveforms(self):
+    def plot_waveforms(self, xlim_override=None):
         self._suspend_axis_capture = True
         try:
             self.figure.clf()
@@ -2992,8 +3020,12 @@ class OscilloscopeAnalyzer(QMainWindow):
             if not sorted_chs:
                 self.canvas.draw()
                 return
+            shared_x = self.btn_shared_x.isChecked()
+            first_ax = None
             for idx, ch in enumerate(sorted_chs, start=1):
-                ax = self.figure.add_subplot(len(sorted_chs), 1, idx)
+                ax = self.figure.add_subplot(len(sorted_chs), 1, idx, sharex=first_ax if shared_x else None)
+                if first_ax is None:
+                    first_ax = ax
                 ax.set_facecolor(self.plot_bg_color)
                 t, y, meta = self.current_data[ch]
                 # apply decimation
@@ -3003,12 +3035,14 @@ class OscilloscopeAnalyzer(QMainWindow):
                 ax.set_ylabel(f"CH{ch} [V]", color=self.fg_color)
                 if idx == len(sorted_chs):
                     ax.set_xlabel("Time [s]", color=self.fg_color)
+                if shared_x and idx < len(sorted_chs):
+                    ax.tick_params(axis='x', which='both', labelbottom=False)
                 ax.tick_params(colors=self.fg_color)
                 for spine in ax.spines.values():
                     spine.set_color(self.fg_color)
                 self._axis_to_channel[ax] = ch
                 self._channel_to_axis[ch] = ax
-                self._apply_saved_axis_limits(ax, ch)
+                self._apply_saved_axis_limits(ax, ch, apply_x=not shared_x)
                 sel = SpanSelector(
                     ax,
                     lambda xmin, xmax, ch=ch: self.on_select(ch, xmin, xmax),
@@ -3016,7 +3050,18 @@ class OscilloscopeAnalyzer(QMainWindow):
                     props=dict(alpha=0.3, facecolor='orange')
                 )
                 self.span_selectors[ch] = sel
+            if xlim_override is not None:
+                for ax in self.figure.axes:
+                    ax.set_xlim(xlim_override)
+            elif shared_x:
+                for ch in sorted_chs:
+                    limits = self.channel_axis_limits.get(ch) if self._preserve_axes_enabled(ch) else None
+                    if limits and limits.get('xlim') is not None:
+                        first_ax.set_xlim(limits['xlim'])
+                        break
             self.figure.tight_layout()
+            if shared_x and len(sorted_chs) > 1:
+                self.figure.subplots_adjust(hspace=0.06)
             if self.preserve_axes_channels:
                 self._capture_current_axis_limits(only_missing=True)
             self.canvas.draw()
@@ -7059,6 +7104,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             "• Load Metadata (L): Load a metadata CSV for MetaMatch.\n"
             "• MetaMatch (M): Find the best metadata match using the active QD3/QDM fit.\n"
             "• Mark Impact (T): Plot a vertical impact marker using distance/velocity.\n"
+            "• Shared Time Axis: Align channel time ranges and use a compact subplot layout.\n"
             "SG / discovery row:\n"
             "• SG Filter (S): Run Savitzky-Golay filtering on the selected channel.\n"
             "• Batch Run: Run SG filtering across a range of events (Ctrl+B).\n"
@@ -7120,7 +7166,12 @@ class OscilloscopeAnalyzer(QMainWindow):
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     app.setStyle('fusion')
+
+    icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
+    app.setWindowIcon(QIcon(icon_path))
+
     win = OscilloscopeAnalyzer()
+    win.setObjectName("OscilloscopeAnalyzer")
     win.showMaximized()
     sys.exit(app.exec_())
 

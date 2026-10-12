@@ -1,22 +1,20 @@
 # Oscilloscope Palantir
 
-DOI: https://doi.org/10.5281/zenodo.18177659
-
 > **Open Use License**  
 > You may use, copy, modify, and redistribute this repository for any purpose, provided that redistributions include this original source code (including this notice). This software is provided "as is" without warranty of any kind.
 
 ## Overview
-Oscilloscope Palantir is a PyQt5 desktop application for reviewing multi-channel LeCroy `.trc` oscilloscope captures, selecting pulse regions, fitting physics-informed models, and exporting the results for downstream studies. The 2025 builds emphasize fast iteration on large campaigns: every zoom, filter, or fit state is cached per dataset, and auxiliary tools (Results Plotter, feature scans, co-adds, etc.) can be launched without leaving the GUI.
+Oscilloscope Palantir is a PyQt5 desktop application for reviewing multi-channel LeCroy `.trc` oscilloscope captures, selecting pulse regions, fitting physics-informed models, and exporting the results for downstream PVDF calibration studies. The 2025 builds emphasize fast iteration on large campaigns: every zoom, filter, or fit state is cached per dataset, and auxiliary tools (Results Plotter, feature scans, co-adds, etc.) can be launched without leaving the GUI.
 
 ## Key Capabilities (2025 release)
 - **Event-aware loader** – Point Palantir at a folder of `.trc` files and it auto-groups channels by event id, tags the dataset path, and preserves zoom/pan ranges on the channels you select as you step through events.
 - **Per-channel axis preservation** – Choose which channels should keep their zoom/pan across events; unselected channels auto-scale on each redraw.
-- **Dynamic fitting suite** – Drag out a fit window per channel and run QD3Fit, QDMFit, CSA_pulse, skew_gaussian, gaussian, low_pass_max (SG-based extremum) or FFT from the same control row. Fits can be inverted, batch-applied, adjusted live, and tied to SG-filtered data via the “Use SG” toggle.
+- **Dynamic fitting suite** – Drag out a fit window per channel and run QD3Fit, QDMFit, CSA_pulse, skew_gaussian, gaussian, low_pass_max (SG-based extremum), low_pass_peak_min (peak-min), or FFT from the same control row. Fits can be inverted, batch-applied, adjusted live, and tied to SG-filtered data via the “Use SG” toggle.
 - **Savitzky–Golay pipeline** – Apply SG overlays per channel, batch them across events (multi-threaded), and transparently cache the filtered traces under `.palantir_sg` so they reload instantly when you revisit an event/width pair.
 - **Waveform co-addition** – Combine multiple events on a selected channel (sum or average). The co-add dialog handles interpolation, shows ±1σ envelopes, and can overlay the contributing traces for context.
 - **Metadata + impact tools** – Load an external CSV, run MetaMatch once a QD3/QDM fit exists, and drop an impact-time marker (distance / velocity) across all channels; the computed impact time is stored on the fit record.
 - **Fit management hub** – View every stored fit in the Fit Info window (with dataset scoping), import/export HDF5 files (including event-quality tags), and launch the Results Plotter to make campaign-level scatter plots that link back to the active GUI via event picking.
-- **Event discovery & filtering** – Use Feature Scan (threshold × σ), Fit Filter (param-based queries), Quality Filter (per-event 0–5 ratings), or manual filter application to focus the event list. Filters compound until you hit Clear Filter.
+- **Event discovery & filtering** – Use Feature Scan (threshold × robust σ), Fit Filter (param-based queries), Quality Filter (per-event 0–5 ratings), or manual filter application to focus the event list. Filters compound until you hit Clear Filter.
 - **Quality & session context** – Tag each event with a quality score, keep running quality metadata per dataset, and document work via the built-in help dialog and keyboard shortcuts.
 - **Analysis companions** – Additional scripts (thickness, segmentation, penetration, velocity-ratio) consume the exported HDF5 data for publication-ready plots.
 
@@ -54,9 +52,9 @@ The app uses the Fusion style for consistent rendering across platforms.
 ## UI Tour & Workflow
 1. **Top row** – Select a folder (F), pick an event, assign a quality score (0–5), and check the active folder path. Use **Help** (H) for shortcuts and **Light/Dark Mode** (Ctrl+T) to toggle themes.
 2. **Navigation / session row** – Step through events (`,` / `.`), set decimation for plotting, and co-add waveforms. Session tools on the right clear fits (`E`), save figures (Ctrl+S), export/import fits (Ctrl+E / Ctrl+I), clear all data (Shift+D), and open Fit Info (`U`).
-3. **Metadata / impact row** – Load a metadata CSV (`L`), run MetaMatch (`M`), set the detector distance, and mark impact time (`T`) across channels.
+3. **Metadata / impact row** – Load a metadata CSV (`L`), run MetaMatch (`M`), set the detector distance, mark impact time (`T`) across channels, and toggle **Shared Time Axis** to align and compact the channel plots.
 4. **Savitzky–Golay & discovery row** – Apply SG filters (`S`), choose the channel + window, run SG Batch (Ctrl+B), clear overlays (Shift+S), and use the **Preserve Axes** menu to pin zoom/pan on selected channels. Launch Results Plotter (`P`), Feature Scan (Ctrl+F), Fit Filter (Ctrl+Shift+F), Quality Filter, or Clear Filter (Ctrl+K).
-5. **Dynamic fit row** – Choose the model (QD3/QDM/CSA/skew/gauss/low_pass_max/FFT), channel, invert toggle (I), and fit decimation. Run (Enter), adjust (`A`), clear (`R`), clear channel fits (Shift+R), batch process (`B`), or force the fit/FFT to use SG-filtered data (`Ctrl+Shift+S`). FFT results open in a separate window with its own NavigationToolbar.
+5. **Dynamic fit row** – Choose the model (QD3/QDM/CSA/skew/gauss/low_pass_max/low_pass_peak_min/FFT), channel, invert toggle (I), and fit decimation. Run (Enter), adjust (`A`), clear (`R`), clear channel fits (Shift+R), batch process (`B`, time window or impact-centered), or force the fit/FFT to use SG-filtered data (`Ctrl+Shift+S`). FFT results open in a separate window with its own NavigationToolbar.
 
 Typical workflow:
 - Select a folder, optionally apply SG filtering, drag-select a region (orange span) per channel, then run fits. Repeat for the channels of interest, review parameters/derived charge + mass in the Fit Info window, mark impacts, and export to HDF5 when satisfied.
@@ -82,6 +80,7 @@ Typical workflow:
 - `(L)oad Metadata` – Load a metadata CSV for MetaMatch.
 - `(M)etaMatch` – Find the best metadata match using the active QD3/QDM fit.
 - `Mark Impact (T)` – Plot a vertical impact marker using distance/velocity.
+- `Shared Time Axis` – Toggle a common time range and one bottom x-axis for compact multi-channel plots.
 
 **SG / discovery row**
 - `(S)G Filter` – Run Savitzky–Golay filtering on the selected channel.
@@ -89,7 +88,7 @@ Typical workflow:
 - `Clear Fit` – Remove the SG overlay for the current event/channel.
 - `Preserve Axes` – Select which channels keep their zoom/pan across events.
 - `Results Plotter` – Open the dataset-level results visualization window.
-- `Feature Scan` – Search events for large excursions vs σ.
+- `Feature Scan` – Search events for large excursions vs robust σ.
 - `Fit Filter` – Filter the event list using fit parameter constraints.
 - `Quality Filter` – Filter events by quality rating threshold.
 - `Clear Filter` – Restore the full event list.
@@ -99,16 +98,16 @@ Typical workflow:
 - `(A)djust Fit` – Edit initial parameters before running the fit.
 - `Clea(r) Fit` – Remove the active dynamic fit result.
 - `Clear Chan Fits` – Remove all fits on the selected channel for this event.
-- `Batch Run` – Run the selected fit across multiple events.
+- `Batch Run` – Run the selected fit across multiple events (time window or impact-centered).
 
 **Toggles**
-- `:(I)nvert` – Invert polarity for fitting (also flips low_pass_max extremum).
+- `:(I)nvert` – Invert polarity for fitting (also flips low_pass_max/low_pass_peak_min extremum).
 - `Use SG` – Use SG-filtered data for fits/FFT when available.
 
 ## Analysis, Filtering, & Persistence
 - **Axis preservation** – Every subplot can record its x/y limits after mouse zoom, pan, or scroll. Use the Preserve Axes menu to keep those limits on a channel across events; unselected channels auto-scale on each redraw.
 - **SG caching** – Filtered traces are cached per dataset/event/channel/window in `.palantir_sg`. Clearing the SG overlay removes the cache for that entry; deleting the folder resets everything.
-- **Feature Scan** – Define an event range, channel, σ-multiplier, and absolute/positive-only mode. The scanner loads each waveform, computes σ, and flags events whose peaks exceed the threshold. Apply the resulting filter list or rescan with new settings.
+- **Feature Scan** – Define an event range, channel, σ-multiplier, smoothing window, and absolute/positive-only mode. The scanner loads each waveform, computes robust σ from a low-pass residual, and flags events whose peaks exceed the threshold. Apply the resulting filter list or rescan with new settings.
 - **Fit Filter** – Query stored fits (current dataset aware) by model, channel, parameter, and comparison (>, between, etc.). The resulting event list can be inspected before filtering the dropdown.
 - **Quality filter** – Rate events with the Quality spin box, then filter to those ≥ a chosen score. Ratings are saved in-memory and exported with your fits.
 - **Manual filters** – All filters compound. The Clear Filter command restores the original event order maintained in `_all_event_keys`.
@@ -118,7 +117,7 @@ Typical workflow:
 - **Impact tracking** – Mark Impact uses distance/velocity to compute a predicted impact time, plots the vertical marker on every channel, and stores the value on the associated fit record for export.
 
 ## Dynamic Fit Functions & Initialization Heuristics
-Palantir seeds each fit with fast heuristics so the first curve-fit iteration lands close to the pulse. All fits run on the selected time window; the **Invert** toggle flips polarity for fitting (except `low_pass_max`, which uses invert to choose a minimum vs maximum). If **Use SG** is enabled, the SG-filtered trace is used for fitting/initialization.
+Palantir seeds each fit with fast heuristics so the first curve-fit iteration lands close to the pulse. All fits run on the selected time window; the **Invert** toggle flips polarity for fitting (except `low_pass_max`/`low_pass_peak_min`, which use invert to choose a minimum vs maximum). If **Use SG** is enabled, the SG-filtered trace is used for fitting/initialization.
 
 - **QD3Fit** – Attempts multiple Savitzky–Golay smoothings (window lengths inferred from the time step, targeting ~1 us / 10 us / 20 us) and estimates `t0` from the strongest negative slope, `q` from the smoothed minimum, and `v` from the rise/fall time (`v ≈ 0.19 / Δt`). The best window is chosen by a quick chi^2 check against the model. `C` starts at the mean of the selected window. Model: a piecewise ramp/decay pulse with time scales derived from `v`, smoothed by Savitzky–Golay, plus a constant offset. In code terms: `dt1 = PUT_d / (v*100)`, `dt2 = (PUT_l - 2*PUT_d) / (v*100)` and
   `signal(t) = { q/dt1*(t-t0) for t0<t<t0+dt1; q*exp(-(t-(t0+dt1))/tau1) for t0+dt1<=t<t0+dt1+dt2; qq - q/dt1*(t-(t0+dt1+dt2)) for t0+dt1+dt2<=t<t0+2*dt1+dt2; qq*exp(-(t-(t0+2*dt1+dt2))/tau2) for t>=t0+2*dt1+dt2 }`, then `SG(signal) + C`.
@@ -127,6 +126,7 @@ Palantir seeds each fit with fast heuristics so the first curve-fit iteration la
 - **skew_gaussian** – Seeds `A` from the area under the curve, `xi` at the peak location, `omega` to ~1/6 of the window width, and `alpha = 0` (symmetric). Model: `y = A * 2/omega * phi(t) * Phi(alpha*t) + C` with `t=(x-xi)/omega`, `phi(t)=(1/sqrt(2*pi))*exp(-t^2/2)`, `Phi(z)=0.5*(1+erf(z/sqrt(2)))`.
 - **gaussian** – Seeds `A` from peak-to-min amplitude, `mu` at the peak, and `sigma` to ~1/6 of the window width. Model: `y = A*exp(-0.5*((x-mu)/sigma)^2) + C`.
 - **low_pass_max** – Not a curve fit: removes a linear baseline (fit to the first 20% of the window), applies an SG low-pass (odd window, derived from the SG control or the prior fit), then reports the extremum time/value. `Invert` flips the search from max to min. Procedure: `baseline(t)=m*t+b`, `y_corr=y-baseline`, `y_f=SG(y_corr,w,2)`, pick `max(y_f)` (or `min` when inverted).
+- **low_pass_peak_min** – Same detrend + SG low-pass as `low_pass_max`, but reports `peak - min` instead of `peak - baseline`. `Invert` flips the sign by swapping the extremum polarity.
 - **FFT** – Applies a Hanning window and displays a log–log spectrum in a dedicated viewer (no fit parameters stored). Procedure: `Y = rfft(y * hann)`, `A = (2/N)*|Y|`.
 
 ## Secondary Analysis Workflows
@@ -139,11 +139,11 @@ After exporting fits you can:
 - **Files & session** – `F` (folder), `Ctrl+S` (save figure), `Ctrl+E` (export), `Ctrl+I` (import), `Shift+D` (clear data)
 - **Metadata** – `L` (load CSV), `M` (MetaMatch)
 - **SG & filters** – `S` (SG), `Ctrl+B` (batch SG), `Shift+S` (clear SG), `P` (Results Plotter), `Ctrl+F` (Feature Scan), `Ctrl+Shift+F` (Fit Filter), `Ctrl+K` (Clear Filter)
-- **Fitting** – `Enter` (run), `A` (adjust), `R` (clear fit), `Shift+R` (clear channel fits), `B` (batch), `Ctrl+Shift+S` (Use SG), `Q/D/C/W/G/X` (model select), number keys (channel), `I` (invert)
+- **Fitting** – `Enter` (run), `A` (adjust), `R` (clear fit), `Shift+R` (clear channel fits), `B` (batch), `Ctrl+Shift+S` (Use SG), `Q/D/C/W/G/X/Z` (model select), number keys (channel), `I` (invert)
 - **Info** – `H` (help), `U` (Fit Info)
 
 ## Troubleshooting
-- **No events listed** – Ensure filenames end with `-<digits>.trc` (e.g., `C3-1042.trc`).
+- **No events listed** – Filenames must start with a channel (`C1`–`C8`) and end with an event number followed by `.trc`. Both older names such as `C4Fe00001.trc` and newer names such as `C4--Fe--00001.trc` are supported; event numbers retain their leading zeros.
 - **No channel detected** – File names must begin with `C1`–`C4`. Mixed casing is tolerated.
 - **Feature/fit filters return nothing** – Clear filters (Ctrl+K) to restore the base event list, then re-run with less restrictive criteria.
 - **MetaMatch unavailable** – Run a QD3 or QDM fit first; `v` from that fit seeds the metadata lookup.

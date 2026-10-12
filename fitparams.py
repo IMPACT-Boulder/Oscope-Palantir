@@ -78,6 +78,20 @@ def CSA_pulse(x, t0, C0, C1, C2, T0, T1, T2, C):
         )
     ) + C
 
+def CSA_pulse_exp(x, C0, A, x0, Tdown, m, x1, Tdec):
+    """
+    Piecewise CSA pulse with exponential down and decay plus linear midsection.
+
+    f(x) = (C0 - A*exp((x-x0)/Tdown))             for x <= x0
+         = (C0 - A + m*(x-x0))                    for x0 < x <= x1
+         = (C0 + (m*(x1-x0) - A)*exp(-(x-x1)/Tdec)) for x > x1
+    """
+    x = np.asarray(x, dtype=np.float64)
+    left = C0 - A * np.exp((x - x0) / Tdown)
+    mid = C0 - A + m * (x - x0)
+    right = C0 + (m * (x1 - x0) - A) * np.exp(-(x - x1) / Tdec)
+    return np.where(x <= x0, left, np.where(x <= x1, mid, right))
+
 def QDMFit(Time, t0, q, v, C):
     v = v * 100
     PUT_l, PUT_d = 15.3, 2.0 #14.5, 1.2
@@ -257,3 +271,18 @@ def gaussian(x, A, mu, sigma, C):
     # avoid divide-by-zero
     sigma = np.where(sigma == 0, 1e-15, sigma)
     return A * np.exp(-0.5 * ((x - mu) / sigma) ** 2) + C
+
+
+def asym_exp_peak(t, A, k1, k2, t0, C):
+    """
+    Asymmetric exponential peak centered at t0.
+
+    f(t) = A * exp(k1 * (t - t0))  + C for t <= t0
+         = A * exp(-k2 * (t - t0)) + C for t >= t0
+    """
+    t = np.asarray(t)
+    left = t <= t0
+    y = np.empty_like(t, dtype=np.float64)
+    y[left] = A * np.exp(k1 * (t[left] - t0)) + C
+    y[~left] = A * np.exp(-k2 * (t[~left] - t0)) + C
+    return y

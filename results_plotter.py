@@ -1112,9 +1112,21 @@ class FitResultsVisualizer(QMainWindow):
         if self.last_plot_df is None or self.last_plot_df.empty:
             QMessageBox.information(self, "Linear Fit", "Nothing plotted yet.")
             return
-        X = self.last_plot_df['X'].values; Y = self.last_plot_df['Y'].values
+        X = self.last_plot_df['X'].values.astype(float)
+        Y = self.last_plot_df['Y'].values.astype(float)
+        finite = np.isfinite(X) & np.isfinite(Y)
+        X = X[finite]; Y = Y[finite]
+        if X.size < 2:
+            QMessageBox.information(self, "Linear Fit", "Not enough points to fit.")
+            return
         denom = float(np.sum(X*X))
         m = float(np.sum(X*Y) / denom) if denom != 0 else np.nan
+        se_m = np.nan
+        if denom != 0 and X.size > 1:
+            resid = Y - m * X
+            sigma2 = float(np.sum(resid * resid) / (X.size - 1))
+            if sigma2 >= 0:
+                se_m = float(np.sqrt(sigma2 / denom))
         self.dprint(f"[run_linear_fit] m={m}, denom={denom}, n={len(X)}")
         ax = self.figure.axes[0]
         try:
@@ -1125,7 +1137,10 @@ class FitResultsVisualizer(QMainWindow):
                 if isinstance(lab, str) and ('Linear Fit (through origin' in lab or 'Linear Fit (origin' in lab):
                     try: ax.lines.remove(ln)
                     except Exception: pass
-            label = f"Linear Fit (through origin) m={m:.2e}"
+            if np.isfinite(se_m):
+                label = f"Linear Fit (through origin) m={m:.2e} +/- {se_m:.2e}"
+            else:
+                label = f"Linear Fit (through origin) m={m:.2e}"
             ax.plot(xline, m*xline, label=label)
             ax.legend(); self.canvas.draw()
         except Exception as e:
@@ -1157,6 +1172,12 @@ class FitResultsVisualizer(QMainWindow):
         ss_res = float(np.sum((Y - yhat)**2))
         ss_tot = float(np.sum((Y - np.mean(Y))**2))
         r2 = (1.0 - ss_res/ss_tot) if ss_tot > 0 else np.nan
+        sxx = float(np.sum((X - np.mean(X))**2))
+        se_m = np.nan
+        if X.size > 2 and sxx > 0:
+            sigma2 = ss_res / (X.size - 2)
+            if sigma2 >= 0:
+                se_m = float(np.sqrt(sigma2 / sxx))
         self.dprint(f"[run_linear_fit_free] m={m}, b={b}, r2={r2}, n={X.size}")
         # Plot line over current axes
         ax = self.figure.axes[0]
@@ -1170,7 +1191,10 @@ class FitResultsVisualizer(QMainWindow):
                         ax.lines.remove(ln)
                     except Exception:
                         pass
-            label = f"Linear Fit (m, b) m={m:.2e}, b={b:.2e}"
+            if np.isfinite(se_m):
+                label = f"Linear Fit (m, b) m={m:.2e} +/- {se_m:.2e}, b={b:.2e}"
+            else:
+                label = f"Linear Fit (m, b) m={m:.2e}, b={b:.2e}"
             ax.plot(xline, m*xline + b, label=label)
             ax.legend(); self.canvas.draw()
         except Exception as e:

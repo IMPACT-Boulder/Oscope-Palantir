@@ -9,12 +9,12 @@ Oscilloscope Palantir is a PyQt5 desktop application for reviewing multi-channel
 ## Key Capabilities (2025 release)
 - **Event-aware loader** – Point Palantir at a folder of `.trc` files and it auto-groups channels by event id, tags the dataset path, and remembers per-channel zoom/pan ranges as you step through events.
 - **Persistent axes + Reset Axes** – Manual zoom/pan actions are captured per channel so that subsequent redraws preserve your view; the Reset Axes control clears those saved domains to return to auto-scaling when needed.
-- **Dynamic fitting suite** – Drag out a fit window per channel and run QD3Fit, QDMFit, CSA_pulse, skew_gaussian, gaussian, low_pass_max (SG-based extremum) or FFT from the same control row. Fits can be inverted, batch-applied, adjusted live, and tied to SG-filtered data via the “Use SG” toggle.
+- **Dynamic fitting suite** – Drag out a fit window per channel and run QD3Fit, QDMFit, CSA_pulse, skew_gaussian, gaussian, low_pass_max (SG-based extremum), low_pass_peak_min (peak-min), or FFT from the same control row. Fits can be inverted, batch-applied, adjusted live, and tied to SG-filtered data via the “Use SG” toggle.
 - **Savitzky–Golay pipeline** – Apply SG overlays per channel, batch them across events (multi-threaded), and transparently cache the filtered traces under `.palantir_sg` so they reload instantly when you revisit an event/width pair.
 - **Waveform co-addition** – Combine multiple events on a selected channel (sum or average). The co-add dialog handles interpolation, shows ±1σ envelopes, and can overlay the contributing traces for context.
 - **Metadata + impact tools** – Load an external CSV, run MetaMatch once a QD3/QDM fit exists, and drop an impact-time marker (distance / velocity) across all channels; the computed impact time is stored on the fit record.
 - **Fit management hub** – View every stored fit in the Fit Info window (with dataset scoping), import/export HDF5 files (including event-quality tags), and launch the Results Plotter to make campaign-level scatter plots that link back to the active GUI via event picking.
-- **Event discovery & filtering** – Use Feature Scan (threshold × σ), Fit Filter (param-based queries), Quality Filter (per-event 0–5 ratings), or manual filter application to focus the event list. Filters compound until you hit Clear Filter.
+- **Event discovery & filtering** – Use Feature Scan (threshold × robust σ), Fit Filter (param-based queries), Quality Filter (per-event 0–5 ratings), or manual filter application to focus the event list. Filters compound until you hit Clear Filter.
 - **Quality & session context** – Tag each event with a quality score, keep running quality metadata per dataset, and document work via the built-in help dialog and keyboard shortcuts.
 - **Analysis companions** – Additional scripts (thickness, segmentation, penetration, velocity-ratio) consume the exported HDF5 data for publication-ready plots.
 
@@ -59,7 +59,7 @@ The app uses the Fusion style for consistent rendering across platforms.
    - **Fit Filter** (Ctrl+Shift+F) for param-based queries,
    - **Quality Filter** for rating-based filtering,
    - **Clear Filter** (Ctrl+K) to restore the full event list.
-5. **Dynamic fit row** – Choose the model (QD3/QDM/CSA/skew/gauss/low_pass_max/FFT), channel, invert toggle, and decimation for fit math. Run (Enter), adjust (`A`), clear (`R`), clear all fits on a channel (Shift+R), batch process (`B`), or force the fit/FFT to use any cached SG trace (`Ctrl+Shift+S`). FFT results open in a separate window with its own NavigationToolbar.
+5. **Dynamic fit row** – Choose the model (QD3/QDM/CSA/skew/gauss/low_pass_max/low_pass_peak_min/FFT), channel, invert toggle, and decimation for fit math. Run (Enter), adjust (`A`), clear (`R`), clear all fits on a channel (Shift+R), batch process (`B`, time window or impact-centered), or force the fit/FFT to use any cached SG trace (`Ctrl+Shift+S`). FFT results open in a separate window with its own NavigationToolbar.
 
 Typical workflow:
 - Select a folder, optionally apply SG filtering, drag-select a region (orange span) per channel, then run fits. Repeat for the channels of interest, review parameters/derived charge + mass in the Fit Info window, mark impacts, and export to HDF5 when satisfied.
@@ -67,7 +67,7 @@ Typical workflow:
 ## Analysis, Filtering, & Persistence
 - **Axis persistence** – Every subplot records its x/y limits after mouse zoom, pan, or scroll; those limits are reapplied when the event redraws, enabling apples-to-apples comparisons across events. Reset Axes wipes the cached limits.
 - **SG caching** – Filtered traces are cached per dataset/event/channel/window in `.palantir_sg`. Clearing the SG overlay removes the cache for that entry; deleting the folder resets everything.
-- **Feature Scan** – Define an event range, channel, σ-multiplier, and absolute/positive-only mode. The scanner loads each waveform, computes σ, and flags events whose peaks exceed the threshold. Apply the resulting filter list or rescan with new settings.
+- **Feature Scan** – Define an event range, channel, σ-multiplier, smoothing window, and absolute/positive-only mode. The scanner loads each waveform, computes robust σ from a low-pass residual, and flags events whose peaks exceed the threshold. Apply the resulting filter list or rescan with new settings.
 - **Fit Filter** – Query stored fits (current dataset aware) by model, channel, parameter, and comparison (>, between, etc.). The resulting event list can be inspected before filtering the dropdown.
 - **Quality filter** – Rate events with the Quality spin box, then filter to those ≥ a chosen score. Ratings are saved in-memory and exported with your fits.
 - **Manual filters** – All filters compound. The Clear Filter command restores the original event order maintained in `_all_event_keys`.
@@ -86,7 +86,7 @@ After exporting fits you can:
 - **Files & session** – `F` (folder), `Ctrl+S` (save figure), `Ctrl+E` (export), `Ctrl+I` (import), `Shift+D` (clear data)
 - **Metadata** – `L` (load CSV), `M` (MetaMatch)
 - **SG & filters** – `S` (SG), `Ctrl+B` (batch SG), `Shift+S` (clear SG), `P` (Results Plotter), `Ctrl+F` (Feature Scan), `Ctrl+Shift+F` (Fit Filter), `Ctrl+K` (Clear Filter)
-- **Fitting** – `Enter` (run), `A` (adjust), `R` (clear fit), `Shift+R` (clear channel fits), `B` (batch), `Ctrl+Shift+S` (Use SG), `Q/D/C/W/G/X` (model select), number keys (channel), `I` (invert)
+- **Fitting** – `Enter` (run), `A` (adjust), `R` (clear fit), `Shift+R` (clear channel fits), `B` (batch), `Ctrl+Shift+S` (Use SG), `Q/D/C/W/G/X/Z` (model select), number keys (channel), `I` (invert)
 - **Info** – `H` (help), `U` (Fit Info)
 
 ## Troubleshooting
