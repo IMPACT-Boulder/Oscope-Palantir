@@ -10,8 +10,9 @@ from PyQt5.QtWidgets import (
     QPushButton, QFileDialog, QLabel, QComboBox, QMessageBox, QCheckBox
 )
 from PyQt5.QtCore import pyqtSignal
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavigationToolbar
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
+from fit_data import best_fit_rows
 
 # Optional calibration helpers — load if present; otherwise features that rely on them are disabled.
 try:
@@ -341,7 +342,7 @@ class FitResultsVisualizer(QMainWindow):
     def _read_one_h5(self, path: str) -> pd.DataFrame:
         self.dprint(f"[_read_one_h5] Reading {path}")
         try:
-            df = pd.read_hdf(path, 'fits')
+            df = pd.read_hdf(path, key='fits')
             self.dprint(f"[_read_one_h5] Loaded 'fits' shape={df.shape}; cols={list(df.columns)[:12]}…")
             df['source_file'] = path
             return df
@@ -388,12 +389,6 @@ class FitResultsVisualizer(QMainWindow):
         self.rebuild_groups()
 
     # ---------------- Grouping / Derived -----------------
-    def _pick_best(self, g: pd.DataFrame) -> pd.Series:
-        """Row with MOST non-NaNs; ties -> last (stable)."""
-        scores = g.notna().sum(axis=1)
-        mx = scores.max()
-        return g.loc[scores.idxmax()] if (scores==mx).sum()==1 else g[scores==mx].iloc[-1]
-
     def _coerce_numeric_all(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty: return df
         for c in df.columns:
@@ -611,10 +606,7 @@ class FitResultsVisualizer(QMainWindow):
             return
         # First, dedupe per (dataset_id, event, channel, fit_type)
         self.dprint("[rebuild_groups] raw shape:", self.raw.shape)
-        dedup = (self.raw
-                 .groupby(['dataset_id','event','channel','fit_type'], dropna=False, as_index=False)
-                 .apply(self._pick_best)
-                 .reset_index(drop=True))
+        dedup = best_fit_rows(self.raw, ['dataset_id', 'event', 'channel', 'fit_type'])
         self.dprint("[rebuild_groups] after per-event dedupe:", dedup.shape)
         # Then split into groups by (dataset_id, fit_type, channel)
         for (ds, ft, ch), g in dedup.groupby(['dataset_id','fit_type','channel'], dropna=False):
@@ -1032,7 +1024,7 @@ class FitResultsVisualizer(QMainWindow):
         # Remove old selection overlay
         try:
             if self._sel_scatter is not None and self._sel_scatter in ax.collections:
-                ax.collections.remove(self._sel_scatter)
+                self._sel_scatter.remove()
         except Exception:
             pass
         self._sel_scatter = None
@@ -1135,7 +1127,7 @@ class FitResultsVisualizer(QMainWindow):
             for ln in list(ax.lines):
                 lab = ln.get_label()
                 if isinstance(lab, str) and ('Linear Fit (through origin' in lab or 'Linear Fit (origin' in lab):
-                    try: ax.lines.remove(ln)
+                    try: ln.remove()
                     except Exception: pass
             if np.isfinite(se_m):
                 label = f"Linear Fit (through origin) m={m:.2e} +/- {se_m:.2e}"
@@ -1188,7 +1180,7 @@ class FitResultsVisualizer(QMainWindow):
                 lab = ln.get_label()
                 if isinstance(lab, str) and lab.startswith('Linear Fit (m, b'):
                     try:
-                        ax.lines.remove(ln)
+                        ln.remove()
                     except Exception:
                         pass
             if np.isfinite(se_m):

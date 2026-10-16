@@ -24,8 +24,8 @@ from   scipy.optimize import curve_fit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PyQt5 import QtWidgets
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRegExp, QSettings
-from PyQt5.QtGui import QRegExpValidator, QKeySequence, QValidator, QIcon
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRegularExpression, QSettings
+from PyQt5.QtGui import QRegularExpressionValidator, QKeySequence, QValidator, QIcon
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QDoubleSpinBox, QSpinBox,
     QPushButton, QComboBox, QFileDialog, QMessageBox, QLabel, QCheckBox, QDialog, QInputDialog,
@@ -34,8 +34,8 @@ from PyQt5.QtWidgets import (
 
 import qtawesome as qta
 
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 from matplotlib.widgets import SpanSelector
 
@@ -314,8 +314,8 @@ class SciFitParamsDialog(QDialog):
         main.addLayout(form)
 
         # Scientific number regex: optional sign, digits (with optional decimal), optional exponent
-        sci_rx = QRegExp(r'^[\+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][\+\-]?\d+)?$')
-        validator = QRegExpValidator(sci_rx, self)
+        sci_rx = QRegularExpression(r'^[\+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][\+\-]?\d+)?$')
+        validator = QRegularExpressionValidator(sci_rx, self)
 
         # Build a row per parameter
         for row, name in enumerate(self._names):
@@ -1057,8 +1057,8 @@ class FitFilterDialog(QDialog):
         grid.addWidget(self.op_combo, 3, 1)
 
         # Threshold(s)
-        sci_rx = QRegExp(r'^[\+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][\+\-]?\d+)?$')
-        self._validator = QRegExpValidator(sci_rx, self)
+        sci_rx = QRegularExpression(r'^[\+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][\+\-]?\d+)?$')
+        self._validator = QRegularExpressionValidator(sci_rx, self)
 
         grid.addWidget(QLabel("Value"), 4, 0)
         self.thr1_edit = QLineEdit("1.0e3")
@@ -2243,7 +2243,7 @@ class OscilloscopeAnalyzer(QMainWindow):
                     # Remove any existing impact lines (dash-dot) before re-adding
                     for ln in list(ax.lines):
                         if ln.get_linestyle() == '-.':
-                            ax.lines.remove(ln)
+                            ln.remove()
                     ax.axvline(it, color='tab:purple', linestyle='-.', linewidth=1.2, label='Impact')
                     ax.legend()
 
@@ -3193,7 +3193,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         for ax in self.figure.axes:
             for ln in list(ax.lines):
                 if ln.get_linestyle() == '-.':
-                    ax.lines.remove(ln)
+                    ln.remove()
             label = f"Impact ({use_type.split('Fit')[0]})" if use_type else "Impact"
             ax.axvline(t_impact, color='tab:purple', linestyle='-.', linewidth=1.2, label=label)
             ax.legend()
@@ -3292,7 +3292,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             return
         try:
             sos = sig.butter(int(order), [low, high], btype='bandpass', output='sos')
-            w, h = sig.sosfreqz(sos, worN=2048, fs=fs)
+            w, h = sig.freqz_sos(sos, worN=2048, fs=fs)
             mag = 20.0 * np.log10(np.maximum(np.abs(h), 1e-12))
             phase = np.unwrap(np.angle(h))
         except Exception as e:
@@ -3971,7 +3971,7 @@ class OscilloscopeAnalyzer(QMainWindow):
             if best_guess:
                 guess.update(best_guess)
         elif func_name == "skew_gaussian":
-            area = np.trapz(y_sel, t_sel)
+            area = np.trapezoid(y_sel, t_sel)
             peak_idx = np.argmax(y_sel)
             guess.update({
                 "A": area,
@@ -4574,7 +4574,7 @@ class OscilloscopeAnalyzer(QMainWindow):
         trough = float(np.min(y_result))
         info_lines.append(f"Peak: {peak:.3e} V   Min: {trough:.3e} V")
         if t_axis.size > 1:
-            area = float(np.trapz(y_result, t_axis))
+            area = float(np.trapezoid(y_result, t_axis))
             rms = float(np.sqrt(np.mean(np.square(y_result))))
             info_lines.append(f"Integral: {area:.3e} V·s   RMS: {rms:.3e} V")
         if stacked_std is not None and mode == "average":
@@ -5230,7 +5230,7 @@ class OscilloscopeAnalyzer(QMainWindow):
                     gid = line.get_gid()
                     if isinstance(gid, str) and gid in removed_keys:
                         try:
-                            ax.lines.remove(line)
+                            line.remove()
                         except Exception:
                             pass
                 ax.legend()
@@ -5881,7 +5881,7 @@ class OscilloscopeAnalyzer(QMainWindow):
                 gid = line.get_gid()
                 if isinstance(gid, str) and pat.match(gid):
                     try:
-                        ax.lines.remove(line)
+                        line.remove()
                     except Exception:
                         pass
             ax.legend()
@@ -6450,7 +6450,9 @@ class OscilloscopeAnalyzer(QMainWindow):
                         return k
                 except Exception:
                     continue
-            return str(s_int)
+            # When no loaded event matches, retain the identifier from the
+            # export so importing before selecting a folder keeps zero padding.
+            return s
 
         # Iterate row-wise and rebuild records
         for _, row in df.iterrows():
@@ -6738,7 +6740,7 @@ class OscilloscopeAnalyzer(QMainWindow):
                 or str(ln.get_label()).startswith('Bandpass')
             ]
             for ln in lines_to_remove:
-                ax.lines.remove(ln)
+                ln.remove()
             ax.legend()
         self.canvas.draw()
         self.fit_info_window.update_info(self.results, self.event_combo.currentText())
